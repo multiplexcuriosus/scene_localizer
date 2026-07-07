@@ -1,0 +1,40 @@
+# Table dimensions are in meters.
+table_shortedge: 0.6
+table_longedge: 1.2
+marker_size: 0.035
+marker_height: 0.0
+
+# marker_translation_origin controls how marker translations are interpreted.
+# This MVP expects marker centers because ArUco detections are marker-center poses.
+marker_translation_origin: center
+
+streams:
+  top_cam:
+    markers:
+      0:
+        translation: [0.07, 0.285, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      1:
+        translation: [0.035, 0.58, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      2:
+        translation: [0.495, 0.355, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      3:
+        translation: [0.53, 0.46, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+
+  eef_cam:
+    markers:
+      0:
+        translation: [0.37, 1.08, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      1:
+        translation: [0.405, 1.165, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      2:
+        translation: [0.23, 1.115, 0.001]
+        rpy: [0.0, 0.0, 0.0]
+      3:
+        translation: [0.195, 1.2, 0.001]
+        rpy: [0.0, 0.0, 0.0]
