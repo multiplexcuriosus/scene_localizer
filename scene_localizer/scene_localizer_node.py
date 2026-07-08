@@ -33,6 +33,7 @@ class StreamConfig:
     camera_frame: str
     pose_topic: str
     min_markers_per_frame: int
+    estimation_mode: str
 
 
 @dataclass
@@ -184,6 +185,9 @@ class SceneLocalizerNode(Node):
         self.declare_parameter("min_markers_per_frame", 1)
         self.declare_parameter("top_min_markers_per_frame", -1)
         self.declare_parameter("eef_min_markers_per_frame", -1)
+        self.declare_parameter("estimation_mode", "marker_center_alignment")
+        self.declare_parameter("top_estimation_mode", "")
+        self.declare_parameter("eef_estimation_mode", "")
         self.declare_parameter("min_estimates_in_window", 3)
         self.declare_parameter("max_candidate_translation_deviation", 0.05)
         self.declare_parameter("max_window_translation_deviation", 0.08)
@@ -196,7 +200,7 @@ class SceneLocalizerNode(Node):
         self.declare_parameter("top_camera_frame", "camera_color_optical_frame")
         self.declare_parameter("eef_camera_frame", "camera_color_optical_frame")
         self.declare_parameter("table_frame", "table_frame")
-        self.declare_parameter("debug_log", False)
+        self.declare_parameter("debug_log", True)
 
         self._table_frame = str(self.get_parameter("table_frame").value)
 
@@ -210,12 +214,33 @@ class SceneLocalizerNode(Node):
         top_min_markers = global_min_markers if top_min_markers_param < 1 else top_min_markers_param
         eef_min_markers = global_min_markers if eef_min_markers_param < 1 else eef_min_markers_param
 
+        valid_modes = {"marker_pose_average", "marker_center_alignment"}
+        global_mode = str(self.get_parameter("estimation_mode").value)
+        top_mode_param = str(self.get_parameter("top_estimation_mode").value)
+        eef_mode_param = str(self.get_parameter("eef_estimation_mode").value)
+        top_mode = top_mode_param if top_mode_param else global_mode
+        eef_mode = eef_mode_param if eef_mode_param else global_mode
+
+        if top_mode not in valid_modes:
+            self.get_logger().warn(
+                f"Invalid top estimation mode '{top_mode}'. "
+                "This stream will skip estimates until configured to one of "
+                f"{sorted(valid_modes)}"
+            )
+        if eef_mode not in valid_modes:
+            self.get_logger().warn(
+                f"Invalid eef estimation mode '{eef_mode}'. "
+                "This stream will skip estimates until configured to one of "
+                f"{sorted(valid_modes)}"
+            )
+
         top_config = StreamConfig(
             name="top_cam",
             detections_topic=str(self.get_parameter("top_detections_topic").value),
             camera_frame=str(self.get_parameter("top_camera_frame").value),
             pose_topic="/scene_localizer/top_cam/table_pose_camera",
             min_markers_per_frame=top_min_markers,
+            estimation_mode=top_mode,
         )
         eef_config = StreamConfig(
             name="eef_cam",
@@ -223,6 +248,7 @@ class SceneLocalizerNode(Node):
             camera_frame=str(self.get_parameter("eef_camera_frame").value),
             pose_topic="/scene_localizer/eef_cam/table_pose_camera",
             min_markers_per_frame=eef_min_markers,
+            estimation_mode=eef_mode,
         )
 
         self._streams: Dict[str, StreamState] = {}
@@ -248,7 +274,8 @@ class SceneLocalizerNode(Node):
                 f"[{stream_name}] markers={len(state.marker_layout)}, "
                 f"sub={state.config.detections_topic}, pub={state.config.pose_topic}, "
                 f"camera_frame={state.config.camera_frame}, "
-                f"min_markers_per_frame={state.config.min_markers_per_frame}"
+                f"min_markers_per_frame={state.config.min_markers_per_frame}, "
+                f"estimation_mode={state.config.estimation_mode}"
             )
             if not state.marker_layout:
                 self._warn_throttled(
@@ -264,6 +291,9 @@ class SceneLocalizerNode(Node):
             f"min_markers_per_frame_global={self.get_parameter('min_markers_per_frame').value}, "
             f"top_min_markers_per_frame={top_min_markers}, "
             f"eef_min_markers_per_frame={eef_min_markers}, "
+            f"estimation_mode_global={global_mode}, "
+            f"top_estimation_mode={top_mode}, "
+            f"eef_estimation_mode={eef_mode}, "
             f"min_estimates_in_window={self.get_parameter('min_estimates_in_window').value}, "
             f"max_candidate_translation_deviation={self.get_parameter('max_candidate_translation_deviation').value}, "
             f"max_window_translation_deviation={self.get_parameter('max_window_translation_deviation').value}, "
@@ -315,7 +345,7 @@ class SceneLocalizerNode(Node):
                     rotation = _rpy_to_matrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
                     if marker_origin in ("bottom_left", "bottom-left", "corner"):
                         corner_to_center_marker = np.array(
-                            [-0.5 * physical_marker_size, 0.5 * physical_marker_size, 0.0],
+                            [0.5 * physical_marker_size, -0.5 * physical_marker_size, 0.0],
                             dtype=float,
                         )
                         translation = translation + rotation @ corner_to_center_marker
@@ -386,10 +416,64 @@ class SceneLocalizerNode(Node):
             )
             return
 
-        min_markers = max(1, int(state.config.min_markers_per_frame))
-        max_candidate_dev = max(0.0, float(self.get_parameter("max_candidate_translation_deviation").value))
         max_translation_jump = max(0.0, float(self.get_parameter("max_translation_jump").value))
         max_rotation_jump_deg = max(0.0, float(self.get_parameter("max_rotation_jump_deg").value))
+
+        frame_estimate: Optional[TransformEstimate] = None
+        if state.config.estimation_mode == "marker_pose_average":
+            frame_estimate = self._estimate_frame_marker_pose_average(state, markers)
+        elif state.config.estimation_mode == "marker_center_alignment":
+            frame_estimate = self._estimate_frame_marker_center_alignment(state, markers)
+        else:
+            self._warn_throttled(
+                f"invalid_mode_{state.config.name}",
+                f"[{state.config.name}] invalid estimation_mode='{state.config.estimation_mode}', "
+                "skipping estimates for this stream",
+                2.0,
+            )
+            return
+
+        if frame_estimate is None:
+            return
+
+        if state.last_accepted_estimate is not None:
+            dt = float(np.linalg.norm(frame_estimate.translation - state.last_accepted_estimate.translation))
+            dq = _quaternion_angular_distance_deg(
+                frame_estimate.quaternion_xyzw,
+                state.last_accepted_estimate.quaternion_xyzw,
+            )
+            if dt > max_translation_jump or dq > max_rotation_jump_deg:
+                self._log_debug(
+                    f"[{state.config.name}] jump reject details dt={dt:.4f}m dq={dq:.3f}deg "
+                    f"thresholds=({max_translation_jump:.4f}m, {max_rotation_jump_deg:.3f}deg)"
+                )
+                self._warn_throttled(
+                    f"jump_reject_{state.config.name}",
+                    f"[{state.config.name}] rejected jump: dt={dt:.3f}m dq={dq:.1f}deg",
+                    1.0,
+                )
+                return
+
+        stamp_sec = self._stamp_to_sec(msg)
+        state.last_source_stamp_sec = stamp_sec
+        state.last_accepted_estimate = frame_estimate
+        state.buffer.append(TimedEstimate(stamp_sec=stamp_sec, estimate=frame_estimate))
+        self._prune_buffer(state)
+        self._log_debug(
+            f"[{state.config.name}] accepted frame estimate "
+            f"t=({frame_estimate.translation[0]:.4f}, {frame_estimate.translation[1]:.4f}, {frame_estimate.translation[2]:.4f}) "
+            f"q=({frame_estimate.quaternion_xyzw[0]:.4f}, {frame_estimate.quaternion_xyzw[1]:.4f}, "
+            f"{frame_estimate.quaternion_xyzw[2]:.4f}, {frame_estimate.quaternion_xyzw[3]:.4f}) "
+            f"mode={state.config.estimation_mode} buffer_size={len(state.buffer)}"
+        )
+
+    def _estimate_frame_marker_pose_average(
+        self,
+        state: StreamState,
+        markers: List[Any],
+    ) -> Optional[TransformEstimate]:
+        min_markers = max(1, int(state.config.min_markers_per_frame))
+        max_candidate_dev = max(0.0, float(self.get_parameter("max_candidate_translation_deviation").value))
 
         candidate_translations: List[np.ndarray] = []
         candidate_quaternions: List[np.ndarray] = []
@@ -446,7 +530,7 @@ class SceneLocalizerNode(Node):
                 f"[{state.config.name}] usable markers below minimum ({len(candidate_translations)} < {min_markers})",
                 1.0,
             )
-            return
+            return None
 
         kept_idx = self._reject_translation_outliers(candidate_translations, max_candidate_dev)
         self._log_debug(
@@ -458,42 +542,93 @@ class SceneLocalizerNode(Node):
                 f"[{state.config.name}] rejected all frame candidates as outliers",
                 1.0,
             )
-            return
+            return None
 
         frame_t = np.mean(np.stack([candidate_translations[i] for i in kept_idx], axis=0), axis=0)
         frame_q = _average_quaternions_xyzw([candidate_quaternions[i] for i in kept_idx])
-        frame_estimate = TransformEstimate(translation=frame_t, quaternion_xyzw=frame_q)
-
-        if state.last_accepted_estimate is not None:
-            dt = float(np.linalg.norm(frame_estimate.translation - state.last_accepted_estimate.translation))
-            dq = _quaternion_angular_distance_deg(
-                frame_estimate.quaternion_xyzw,
-                state.last_accepted_estimate.quaternion_xyzw,
-            )
-            if dt > max_translation_jump or dq > max_rotation_jump_deg:
-                self._log_debug(
-                    f"[{state.config.name}] jump reject details dt={dt:.4f}m dq={dq:.3f}deg "
-                    f"thresholds=({max_translation_jump:.4f}m, {max_rotation_jump_deg:.3f}deg)"
-                )
-                self._warn_throttled(
-                    f"jump_reject_{state.config.name}",
-                    f"[{state.config.name}] rejected jump: dt={dt:.3f}m dq={dq:.1f}deg",
-                    1.0,
-                )
-                return
-
-        stamp_sec = self._stamp_to_sec(msg)
-        state.last_source_stamp_sec = stamp_sec
-        state.last_accepted_estimate = frame_estimate
-        state.buffer.append(TimedEstimate(stamp_sec=stamp_sec, estimate=frame_estimate))
-        self._prune_buffer(state)
         self._log_debug(
-            f"[{state.config.name}] accepted frame estimate "
-            f"t=({frame_estimate.translation[0]:.4f}, {frame_estimate.translation[1]:.4f}, {frame_estimate.translation[2]:.4f}) "
-            f"q=({frame_estimate.quaternion_xyzw[0]:.4f}, {frame_estimate.quaternion_xyzw[1]:.4f}, "
-            f"{frame_estimate.quaternion_xyzw[2]:.4f}, {frame_estimate.quaternion_xyzw[3]:.4f}) "
-            f"candidates={len(kept_idx)}/{len(candidate_translations)} buffer_size={len(state.buffer)}"
+            f"[{state.config.name}] pose-average candidates={len(kept_idx)}/{len(candidate_translations)}"
         )
+        return TransformEstimate(translation=frame_t, quaternion_xyzw=frame_q)
+
+    def _estimate_frame_marker_center_alignment(
+        self,
+        state: StreamState,
+        markers: List[Any],
+    ) -> Optional[TransformEstimate]:
+        min_markers = max(1, int(state.config.min_markers_per_frame))
+        max_candidate_dev = max(0.0, float(self.get_parameter("max_candidate_translation_deviation").value))
+
+        table_points: List[np.ndarray] = []
+        camera_points: List[np.ndarray] = []
+        used_marker_ids: List[int] = []
+
+        for marker in markers:
+            marker_id = self._extract_marker_id(marker)
+            if marker_id is None or marker_id not in state.marker_layout:
+                continue
+
+            pose = self._extract_pose_from_marker(marker)
+            if pose is None:
+                continue
+
+            p_camera = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
+            p_table = state.marker_layout[marker_id].translation
+
+            camera_points.append(p_camera)
+            table_points.append(p_table)
+            used_marker_ids.append(marker_id)
+
+        if len(camera_points) < min_markers:
+            self._warn_throttled(
+                f"too_few_markers_{state.config.name}",
+                f"[{state.config.name}] usable markers below minimum ({len(camera_points)} < {min_markers})",
+                1.0,
+            )
+            return None
+
+        if len(camera_points) < 3:
+            self._warn_throttled(
+                f"too_few_markers_alignment_{state.config.name}",
+                f"[{state.config.name}] marker_center_alignment needs at least 3 markers "
+                f"({len(camera_points)} available)",
+                1.0,
+            )
+            return None
+
+        p = np.stack(table_points, axis=0)
+        q = np.stack(camera_points, axis=0)
+
+        p_mean = np.mean(p, axis=0)
+        q_mean = np.mean(q, axis=0)
+        p_centered = p - p_mean
+        q_centered = q - q_mean
+
+        h = p_centered.T @ q_centered
+        u, _, vt = np.linalg.svd(h)
+        r = vt.T @ u.T
+        if float(np.linalg.det(r)) < 0.0:
+            vt[-1, :] *= -1.0
+            r = vt.T @ u.T
+
+        t = q_mean - r @ p_mean
+        q_ct = _matrix_to_quaternion_xyzw(r)
+
+        residuals = q - (r @ p.T).T - t
+        rms = float(np.sqrt(np.mean(np.sum(residuals * residuals, axis=1))))
+
+        self._log_debug(
+            f"[{state.config.name}] center-alignment used markers={used_marker_ids} rms={rms:.5f}m"
+        )
+        if rms > max_candidate_dev:
+            self._warn_throttled(
+                f"alignment_rms_high_{state.config.name}",
+                f"[{state.config.name}] center-alignment RMS residual high: {rms:.4f}m "
+                f"(threshold={max_candidate_dev:.4f}m)",
+                1.0,
+            )
+
+        return TransformEstimate(translation=t, quaternion_xyzw=q_ct)
 
     def _prune_buffer(self, state: StreamState) -> None:
         window_sec = max(0.1, float(self.get_parameter("window_sec").value))

@@ -69,7 +69,7 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("eef_debug_image_topic", "/scene_localizer/eef_cam/reprojection_debug")
         self.declare_parameter("eef_table_pose_topic", "/scene_localizer/eef_cam/table_pose_camera")
 
-        self.declare_parameter("marker_size", 0.035)
+        self.declare_parameter("physical_marker_size", 0.035)
         self.declare_parameter("axis_length", 0.08)
         self.declare_parameter("detection_timeout_sec", 0.3)
         self.declare_parameter("publish_debug_images", True)
@@ -196,6 +196,8 @@ class SceneLocalizerDebugNode(Node):
                 )
                 return
 
+            self._draw_projection_debug_text(frame, msg, stream)
+
             if stream.latest_camera_info is None:
                 self._draw_status_text(frame, "no camera_info", (0, 140, 255))
                 self._publish_debug_image(stream, msg, frame)
@@ -220,13 +222,13 @@ class SceneLocalizerDebugNode(Node):
                 self._publish_debug_image(stream, msg, frame)
                 return
 
-            marker_size = max(1e-6, float(self.get_parameter("marker_size").value))
+            physical_marker_size = max(1e-6, float(self.get_parameter("physical_marker_size").value))
             axis_length = max(1e-6, float(self.get_parameter("axis_length").value))
             self._draw_detection_overlay(
                 frame=frame,
                 camera_info=stream.latest_camera_info,
                 detections_msg=stream.latest_detections,
-                marker_size=marker_size,
+                physical_marker_size=physical_marker_size,
                 axis_length=axis_length,
             )
             self._draw_table_rectangle_overlay(frame, stream.latest_camera_info, stream)
@@ -239,12 +241,63 @@ class SceneLocalizerDebugNode(Node):
         debug_msg.header = src_msg.header
         stream.debug_pub.publish(debug_msg)
 
+    def _draw_projection_debug_text(self, frame: np.ndarray, image_msg: Image, stream: CameraStreamState) -> None:
+        image_frame_id = str(getattr(image_msg.header, "frame_id", ""))
+        image_text = f"image: {int(getattr(image_msg, 'width', 0))} {int(getattr(image_msg, 'height', 0))} {image_frame_id}"
+
+        camera_info = stream.latest_camera_info
+        if camera_info is None:
+            camera_info_text = "camera_info: n/a"
+            k_text = "K: n/a"
+            d_text = "D: n/a"
+        else:
+            camera_info_frame_id = str(getattr(camera_info.header, "frame_id", ""))
+            fx = float(camera_info.k[0]) if len(camera_info.k) >= 1 else float("nan")
+            fy = float(camera_info.k[4]) if len(camera_info.k) >= 5 else float("nan")
+            cx = float(camera_info.k[2]) if len(camera_info.k) >= 3 else float("nan")
+            cy = float(camera_info.k[5]) if len(camera_info.k) >= 6 else float("nan")
+            camera_info_text = (
+                f"camera_info: {int(camera_info.width)} {int(camera_info.height)} {camera_info_frame_id}"
+            )
+            k_text = f"K: fx={fx:.3f} fy={fy:.3f} cx={cx:.3f} cy={cy:.3f}"
+            if len(camera_info.d) > 0:
+                d_text = "D: " + " ".join(f"{float(v):.4f}" for v in camera_info.d)
+            else:
+                d_text = "D: []"
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        detections_age = self._format_age(now_sec, stream.latest_detection_time_sec)
+        table_pose_age = self._format_age(now_sec, stream.latest_table_pose_time_sec)
+
+        lines = [
+            image_text,
+            camera_info_text,
+            k_text,
+            d_text,
+            f"table_pose age: {table_pose_age}",
+            f"detections age: {detections_age}",
+        ]
+
+        y = 18
+        for line in lines:
+            cv2.putText(
+                frame,
+                line,
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 18
+
     def _draw_detection_overlay(
         self,
         frame: np.ndarray,
         camera_info: CameraInfo,
         detections_msg: ArucoDetection,
-        marker_size: float,
+        physical_marker_size: float,
         axis_length: float,
     ) -> None:
         markers = self._extract_markers_from_msg(detections_msg)
@@ -252,7 +305,7 @@ class SceneLocalizerDebugNode(Node):
             self._draw_status_text(frame, "no detections", (0, 140, 255))
             return
 
-        local_half = 0.5 * marker_size
+        local_half = 0.5 * physical_marker_size
         square_local = np.array(
             [
                 [-local_half, -local_half, 0.0],
@@ -376,22 +429,42 @@ class SceneLocalizerDebugNode(Node):
             np.array([0.0, table_longedge, table_edge_z], dtype=float),
         ]
 
+        corners_cam = [r_ct @ p_table + t_ct for p_table in corners_table]
+
         projected: List[Optional[Tuple[int, int]]] = []
-        for p_table in corners_table:
-            p_cam = r_ct @ p_table + t_ct
-            projected.append(self._project_point(camera_info, p_cam))
+        for p_cam in corners_cam:
+            uv = self._project_point(camera_info, p_cam)
+            projected.append(uv)
 
         visible_count = sum(1 for p in projected if p is not None)
-        if visible_count < 2:
-            self._draw_status_text(frame, "table rectangle not visible/projectable", (0, 0, 255))
-            return
+
+
+        # (0,1):  short edge at wall
+        # (1,2): long edge away from wall
+        # (2,3): short edge away from wall
+        # (3,0): long edge at wall
 
         edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+
+        clipped_edge_count = 0
+        drawn_edge_count = 0
+
         for i0, i1 in edges:
-            p0 = projected[i0]
-            p1 = projected[i1]
-            if p0 is not None and p1 is not None:
-                cv2.line(frame, p0, p1, (0, 0, 255), 3)
+            clipped = self._clip_camera_edge_to_near_plane(corners_cam[i0], corners_cam[i1])
+            if clipped is None:
+                continue
+
+            p0_cam, p1_cam = clipped
+            if (corners_cam[i0][2] <= 1e-4 < corners_cam[i1][2]) or (corners_cam[i1][2] <= 1e-4 < corners_cam[i0][2]):
+                clipped_edge_count += 1
+
+            p0_uv = self._project_point(camera_info, p0_cam)
+            p1_uv = self._project_point(camera_info, p1_cam)
+            if p0_uv is None or p1_uv is None:
+                continue
+
+            cv2.line(frame, p0_uv, p1_uv, (0, 0, 255), 3)
+            drawn_edge_count += 1
 
         labels = ["origin", "x", "x+y", "y"]
         for idx, point in enumerate(projected):
@@ -408,6 +481,14 @@ class SceneLocalizerDebugNode(Node):
                 1,
                 cv2.LINE_AA,
             )
+
+        if drawn_edge_count == 0 and visible_count == 0:
+            self._draw_status_text(frame, "table rectangle not visible/projectable", (0, 0, 255))
+
+        self.get_logger().debug(
+            f"[{stream.name}] table rectangle overlay: visible_corners={visible_count}, "
+            f"clipped_edges={clipped_edge_count}, drawn_edges={drawn_edge_count}"
+        )
 
     @staticmethod
     def _extract_markers_from_msg(msg: ArucoDetection) -> List[Any]:
@@ -489,24 +570,73 @@ class SceneLocalizerDebugNode(Node):
         if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z) or z <= 1e-9:
             return None
 
-        k = camera_info.k
-        if len(k) < 9:
+        if len(camera_info.k) < 9:
             return None
 
-        fx = float(k[0])
-        fy = float(k[4])
-        cx = float(k[2])
-        cy = float(k[5])
-
-        if not np.isfinite(fx) or not np.isfinite(fy) or abs(fx) < 1e-9 or abs(fy) < 1e-9:
+        k = np.asarray(camera_info.k, dtype=float).reshape(3, 3)
+        if not np.all(np.isfinite(k)):
             return None
 
-        u = fx * x / z + cx
-        v = fy * y / z + cy
+        dist_coeffs = np.asarray(camera_info.d, dtype=float).reshape(-1, 1) if len(camera_info.d) > 0 else None
+        object_points = np.array([[[x, y, z]]], dtype=np.float64)
+        rvec = np.zeros((3, 1), dtype=np.float64)
+        tvec = np.zeros((3, 1), dtype=np.float64)
+
+        image_points, _ = cv2.projectPoints(object_points, rvec, tvec, k, dist_coeffs)
+        if image_points is None or image_points.shape[0] == 0:
+            return None
+
+        u = float(image_points[0, 0, 0])
+        v = float(image_points[0, 0, 1])
         if not np.isfinite(u) or not np.isfinite(v):
             return None
 
         return int(round(u)), int(round(v))
+
+    @staticmethod
+    def _clip_camera_edge_to_near_plane(
+        p0_cam: np.ndarray,
+        p1_cam: np.ndarray,
+        near_z: float = 1e-4,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        if p0_cam.shape != (3,) or p1_cam.shape != (3,):
+            return None
+
+        z0 = float(p0_cam[2])
+        z1 = float(p1_cam[2])
+        if not np.isfinite(z0) or not np.isfinite(z1):
+            return None
+
+        if z0 <= near_z and z1 <= near_z:
+            return None
+
+        if z0 > near_z and z1 > near_z:
+            return p0_cam, p1_cam
+
+        denom = z1 - z0
+        if abs(denom) < 1e-12:
+            return None
+
+        if z0 <= near_z < z1:
+            t = (near_z - z0) / denom
+            p_clip = p0_cam + t * (p1_cam - p0_cam)
+            p_clip = np.array([float(p_clip[0]), float(p_clip[1]), float(near_z)], dtype=float)
+            return p_clip, p1_cam
+
+        if z1 <= near_z < z0:
+            t = (near_z - z0) / denom
+            p_clip = p0_cam + t * (p1_cam - p0_cam)
+            p_clip = np.array([float(p_clip[0]), float(p_clip[1]), float(near_z)], dtype=float)
+            return p0_cam, p_clip
+
+        return None
+
+    @staticmethod
+    def _format_age(now_sec: float, stamp_sec: Optional[float]) -> str:
+        if stamp_sec is None:
+            return "n/a"
+        age_sec = max(0.0, now_sec - float(stamp_sec))
+        return f"{age_sec:.3f}s"
 
     @staticmethod
     def _draw_status_text(frame: np.ndarray, text: str, color: Tuple[int, int, int]) -> None:
