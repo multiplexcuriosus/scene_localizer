@@ -1,0 +1,35 @@
+scene_localizer:
+  ros__parameters:
+    marker_layout_yaml: "/home/jau/dyros/src/scene_localizer/config/table_marker_layout.yaml"
+    base_cam_calibration_yaml: "/tmp/T_base_cam.yaml"
+
+    robot_base_frame: "base"
+    calibration_link_frame: "fr3_link6"
+    top_camera_frame: "camera_color_optical_frame"
+    table_frame: "table_frame"
+
+    top_detections_topic: "/aruco_top_cam/aruco_detections"
+    top_camera_table_pose_topic: "/scene_localizer/top_cam/table_pose_camera"
+    robot_base_top_camera_pose_topic: "/scene_localizer/top_cam/camera_pose_robot_base"
+    robot_base_table_pose_topic: "/scene_localizer/table_pose_robot_base"
+
+    window_sec: 5.0
+    publish_rate_hz: 10.0
+    min_markers_per_frame: 1
+    top_min_markers_per_frame: -1
+    estimation_mode: "marker_center_alignment"
+    top_estimation_mode: ""
+    min_estimates_in_window: 3
+    max_candidate_translation_deviation: 0.05
+    max_window_translation_deviation: 0.08
+    max_translation_jump: 0.12
+    max_rotation_jump_deg: 35.0
+    smoothing_alpha: 0.25
+
+    publish_tf: true
+    publish_robot_base_top_camera_tf: true
+    publish_robot_base_table_tf: true
+    publish_top_camera_table_tf: false
+    top_camera_table_tf_child_frame: "top_cam_table_frame"
+
+    debug_log: false

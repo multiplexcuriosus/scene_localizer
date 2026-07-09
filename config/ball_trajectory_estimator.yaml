@@ -1,0 +1,30 @@
+ball_trajectory_estimator:
+  ros__parameters:
+    input_topic: "/scene_localizer/top_cam/ball_3d_table"
+    output_topic: "/scene/ball_trajectory_table"
+    marker_topic: "/scene/ball_trajectory_marker"
+
+    table_frame: "table_frame"
+
+    min_observations: 3
+    max_buffer_size: 10
+    buffer_time_window_sec: 0.5
+    min_time_span_sec: 0.05
+    max_detection_age_sec: 0.25
+
+    min_speed_mps: 0.05
+    max_speed_mps: 10.0
+    max_fit_rms_error_m: 0.03
+
+    end_point_mode: "latest"
+    trajectory_forward_time_sec: 0.15
+
+    publish_invalid_trajectory: true
+
+    marker_scale: 0.01
+    marker_r: 1.0
+    marker_g: 0.2
+    marker_b: 0.0
+    marker_a: 1.0
+
+    debug_log: false

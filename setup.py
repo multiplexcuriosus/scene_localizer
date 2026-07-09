@@ -29,6 +29,8 @@ setup(
         'console_scripts': [
             'scene_localizer = scene_localizer.scene_localizer_node:main',
             'scene_localizer_debug = scene_localizer.scene_localizer_debug_node:main',
+            'ball_3d_pose_estimator = scene_localizer.ball_3d_pose_estimator_node:main',
+            'ball_trajectory_estimator = scene_localizer.ball_trajectory_estimator:main',
         ],
     },
 )

@@ -1,0 +1,14 @@
+scene_localizer_debug:
+  ros__parameters:
+    ball_trajectory_topic: "/scene/ball_trajectory_table"
+
+    top_trajectory_debug_image_topic: "/scene_localizer/top_cam/ball_trajectory_debug"
+    eef_trajectory_debug_image_topic: "/scene_localizer/eef_cam/ball_trajectory_debug"
+
+    publish_trajectory_debug_images: true
+    trajectory_timeout_sec: 0.5
+    draw_trajectory_debug_text: true
+
+    trajectory_line_thickness: 3
+    trajectory_start_radius_px: 5
+    trajectory_end_radius_px: 7

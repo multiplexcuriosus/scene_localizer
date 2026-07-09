@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,12 +8,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import rclpy
+import rclpy.time
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from aruco_opencv_msgs.msg import ArucoDetection
-from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
+from geometry_msgs.msg import Pose, PointStamped, PoseStamped, TransformStamped
+from scene_localizer.msg import BallTrajectory
+from rclpy.duration import Duration
 from rclpy.node import Node
-from tf2_ros import TransformBroadcaster
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 
 @dataclass
@@ -27,24 +32,23 @@ class TimedEstimate:
 
 
 @dataclass
-class StreamConfig:
-    name: str
-    detections_topic: str
-    camera_frame: str
-    pose_topic: str
-    min_markers_per_frame: int
-    estimation_mode: str
-
-
-@dataclass
-class StreamState:
-    config: StreamConfig
+class TopCamState:
     marker_layout: Dict[int, TransformEstimate]
-    pose_pub: Any
     buffer: List[TimedEstimate] = field(default_factory=list)
     last_accepted_estimate: Optional[TransformEstimate] = None
     last_published_estimate: Optional[TransformEstimate] = None
     last_source_stamp_sec: Optional[float] = None
+
+
+@dataclass
+class CalibrationYamlTransform:
+    parent_frame: str
+    child_frame: str
+    estimate: TransformEstimate
+
+
+def _clean_frame(frame: str) -> str:
+    return str(frame).strip().strip("/")
 
 
 def _normalize_quaternion_xyzw(q: np.ndarray) -> np.ndarray:
@@ -113,21 +117,58 @@ def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
     )
 
 
-def _invert_transform(translation: np.ndarray, rotation: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    r_inv = rotation.T
-    t_inv = -r_inv @ translation
-    return t_inv, r_inv
+def _estimate_to_matrix(estimate: TransformEstimate) -> np.ndarray:
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = _quaternion_to_matrix_xyzw(estimate.quaternion_xyzw)
+    transform[:3, 3] = estimate.translation
+    return transform
 
 
-def _compose_transform(
-    t_ab: np.ndarray,
-    r_ab: np.ndarray,
-    t_bc: np.ndarray,
-    r_bc: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    t_ac = t_ab + r_ab @ t_bc
-    r_ac = r_ab @ r_bc
-    return t_ac, r_ac
+def _matrix_to_estimate(transform: np.ndarray) -> TransformEstimate:
+    return TransformEstimate(
+        translation=np.array(transform[:3, 3], dtype=float),
+        quaternion_xyzw=_matrix_to_quaternion_xyzw(np.array(transform[:3, :3], dtype=float)),
+    )
+
+
+def _invert_matrix(transform: np.ndarray) -> np.ndarray:
+    out = np.eye(4, dtype=float)
+    r = transform[:3, :3]
+    t = transform[:3, 3]
+    out[:3, :3] = r.T
+    out[:3, 3] = -r.T @ t
+    return out
+
+
+def _transform_point(transform: np.ndarray, point: np.ndarray) -> np.ndarray:
+    return transform[:3, :3] @ point + transform[:3, 3]
+
+
+def _is_finite_vector(v: np.ndarray) -> bool:
+    return bool(v.shape == (3,) and np.all(np.isfinite(v)))
+
+
+def _transform_stamped_to_matrix(msg: TransformStamped) -> np.ndarray:
+    q = np.array(
+        [
+            msg.transform.rotation.x,
+            msg.transform.rotation.y,
+            msg.transform.rotation.z,
+            msg.transform.rotation.w,
+        ],
+        dtype=float,
+    )
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = _quaternion_to_matrix_xyzw(q)
+    transform[:3, 3] = np.array(
+        [
+            msg.transform.translation.x,
+            msg.transform.translation.y,
+            msg.transform.translation.z,
+        ],
+        dtype=float,
+    )
+    return transform
 
 
 def _quaternion_angular_distance_deg(q1: np.ndarray, q2: np.ndarray) -> float:
@@ -167,141 +208,202 @@ def _blend_quaternions_xyzw(prev_q: np.ndarray, curr_q: np.ndarray, alpha: float
 
 
 class SceneLocalizerNode(Node):
+    """
+    Top-camera-only scene localizer.
+
+    Input:
+      - /aruco_top_cam/aruco_detections
+      - marker layout YAML with table-frame marker coordinates
+      - optional calibration YAML describing one of:
+          * T_robot_base_top_camera
+          * T_top_camera_robot_base
+          * T_calibration_link_top_camera
+          * T_top_camera_calibration_link
+
+    Output:
+      - T_top_camera_table as PoseStamped
+      - T_robot_base_top_camera as PoseStamped
+      - T_robot_base_table as PoseStamped
+      - optional TF broadcasts for robot_base -> top_camera and robot_base -> table
+      - valid middle-line/trajectory intersection as PoseStamped in robot_base_frame
+      - optional TF broadcast table_frame -> ball_3d_frame from PointStamped ball detections
+    """
+
     def __init__(self) -> None:
         super().__init__("scene_localizer")
 
         self._last_warn_time_ns: Dict[str, int] = {}
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_broadcaster = TransformBroadcaster(self)
 
         try:
             share_dir = Path(get_package_share_directory("scene_localizer"))
-            default_yaml = share_dir / "config" / "table_marker_layout.yaml"
+            default_marker_yaml = share_dir / "config" / "table_marker_layout.yaml"
         except Exception:
-            default_yaml = Path(__file__).resolve().parents[1] / "config" / "table_marker_layout.yaml"
+            default_marker_yaml = Path(__file__).resolve().parents[1] / "config" / "table_marker_layout.yaml"
 
-        self.declare_parameter("marker_layout_yaml", str(default_yaml))
+        self.declare_parameter("marker_layout_yaml", str(default_marker_yaml))
+        self.declare_parameter("base_cam_calibration_yaml", "/tmp/T_base_cam.yaml")
+
+        self.declare_parameter("robot_base_frame", "base")
+        self.declare_parameter("calibration_link_frame", "fr3_link6")
+        self.declare_parameter("top_camera_frame", "camera_color_optical_frame")
+        self.declare_parameter("table_frame", "table_frame")
+
+        self.declare_parameter("top_detections_topic", "/aruco_top_cam/aruco_detections")
+        self.declare_parameter("top_camera_table_pose_topic", "/scene_localizer/top_cam/table_pose_camera")
+        self.declare_parameter("robot_base_top_camera_pose_topic", "/scene_localizer/top_cam/camera_pose_robot_base")
+        self.declare_parameter("robot_base_table_pose_topic", "/scene_localizer/table_pose_robot_base")
+
+        # The ball_trajectory_estimator is responsible for all trajectory
+        # validity/intersection checks. This node only transforms a valid
+        # trajectory end_point from table_frame into robot_base_frame.
+        self.declare_parameter("ball_trajectory_topic", "/scene/ball_trajectory_table")
+        self.declare_parameter(
+            "middle_line_intersection_pose_robot_base_topic",
+            "/scene/middle_line_intersection_pose_robot_base",
+        )
+        self.declare_parameter("publish_middle_line_intersection_pose_robot_base", True)
+        self.declare_parameter("trajectory_timeout_sec", 0.5)
+        self.declare_parameter("tcp_frame", "right_fr3_hand_tcp")
+        self.declare_parameter("intersection_pose_orientation_mode", "tcp_current")
+
+        # Optional TF for the latest 3D ball point. The input is expected as
+        # geometry_msgs/PointStamped in table_frame, e.g. from ball_3d_pose_estimator.
+        self.declare_parameter("ball_3d_topic", "/scene_localizer/top_cam/ball_3d_table")
+        self.declare_parameter("publish_table_ball_3d_tf", True)
+        self.declare_parameter("ball_3d_frame", "ball_3d")
+        self.declare_parameter("ball_3d_timeout_sec", 0.5)
+
         self.declare_parameter("window_sec", 5.0)
         self.declare_parameter("publish_rate_hz", 10.0)
         self.declare_parameter("min_markers_per_frame", 1)
         self.declare_parameter("top_min_markers_per_frame", -1)
-        self.declare_parameter("eef_min_markers_per_frame", -1)
         self.declare_parameter("estimation_mode", "marker_center_alignment")
         self.declare_parameter("top_estimation_mode", "")
-        self.declare_parameter("eef_estimation_mode", "")
         self.declare_parameter("min_estimates_in_window", 3)
         self.declare_parameter("max_candidate_translation_deviation", 0.05)
         self.declare_parameter("max_window_translation_deviation", 0.08)
         self.declare_parameter("max_translation_jump", 0.12)
         self.declare_parameter("max_rotation_jump_deg", 35.0)
         self.declare_parameter("smoothing_alpha", 0.25)
-        self.declare_parameter("publish_tf", False)
-        self.declare_parameter("top_detections_topic", "/aruco_top_cam/aruco_detections")
-        self.declare_parameter("eef_detections_topic", "/aruco_eef_cam/aruco_detections")
-        self.declare_parameter("top_camera_frame", "camera_color_optical_frame")
-        self.declare_parameter("eef_camera_frame", "camera_color_optical_frame")
-        self.declare_parameter("table_frame", "table_frame")
-        self.declare_parameter("debug_log", True)
 
-        self._table_frame = str(self.get_parameter("table_frame").value)
+        # PoseStamped topics are always published when estimates exist.
+        # TF publication is useful for downstream nodes, but disable it if another
+        # node already publishes the same child frames.
+        self.declare_parameter("publish_tf", True)
+        self.declare_parameter("publish_robot_base_top_camera_tf", True)
+        self.declare_parameter("publish_robot_base_table_tf", True)
+        self.declare_parameter("publish_top_camera_table_tf", False)
+        self.declare_parameter("top_camera_table_tf_child_frame", "top_cam_table_frame")
+
+        self.declare_parameter("debug_log", False)
+
+        self._robot_base_frame = _clean_frame(self.get_parameter("robot_base_frame").value)
+        self._calibration_link_frame = _clean_frame(self.get_parameter("calibration_link_frame").value)
+        self._top_camera_frame = _clean_frame(self.get_parameter("top_camera_frame").value)
+        self._table_frame = _clean_frame(self.get_parameter("table_frame").value)
 
         marker_layout_yaml = str(self.get_parameter("marker_layout_yaml").value)
-        stream_layouts = self._load_layout_by_stream(marker_layout_yaml)
+        self._state = TopCamState(marker_layout=self._load_top_marker_layout(marker_layout_yaml))
+
+        self._calibration_yaml_path = str(self.get_parameter("base_cam_calibration_yaml").value)
+        self._calibration_yaml_transform = self._load_calibration_yaml(self._calibration_yaml_path)
+        self._last_robot_base_top_camera: Optional[TransformEstimate] = None
+        self._last_robot_base_table: Optional[TransformEstimate] = None
+        self._latest_ball_trajectory: Optional[BallTrajectory] = None
+        self._latest_ball_trajectory_time_sec: Optional[float] = None
+        self._latest_ball_3d_point: Optional[PointStamped] = None
+        self._latest_ball_3d_point_time_sec: Optional[float] = None
 
         global_min_markers = max(1, int(self.get_parameter("min_markers_per_frame").value))
         top_min_markers_param = int(self.get_parameter("top_min_markers_per_frame").value)
-        eef_min_markers_param = int(self.get_parameter("eef_min_markers_per_frame").value)
-
-        top_min_markers = global_min_markers if top_min_markers_param < 1 else top_min_markers_param
-        eef_min_markers = global_min_markers if eef_min_markers_param < 1 else eef_min_markers_param
+        self._top_min_markers = global_min_markers if top_min_markers_param < 1 else top_min_markers_param
 
         valid_modes = {"marker_pose_average", "marker_center_alignment"}
         global_mode = str(self.get_parameter("estimation_mode").value)
         top_mode_param = str(self.get_parameter("top_estimation_mode").value)
-        eef_mode_param = str(self.get_parameter("eef_estimation_mode").value)
-        top_mode = top_mode_param if top_mode_param else global_mode
-        eef_mode = eef_mode_param if eef_mode_param else global_mode
-
-        if top_mode not in valid_modes:
+        self._top_estimation_mode = top_mode_param if top_mode_param else global_mode
+        if self._top_estimation_mode not in valid_modes:
             self.get_logger().warn(
-                f"Invalid top estimation mode '{top_mode}'. "
-                "This stream will skip estimates until configured to one of "
-                f"{sorted(valid_modes)}"
-            )
-        if eef_mode not in valid_modes:
-            self.get_logger().warn(
-                f"Invalid eef estimation mode '{eef_mode}'. "
-                "This stream will skip estimates until configured to one of "
-                f"{sorted(valid_modes)}"
+                f"Invalid top estimation mode '{self._top_estimation_mode}'. "
+                f"Use one of {sorted(valid_modes)}."
             )
 
-        top_config = StreamConfig(
-            name="top_cam",
-            detections_topic=str(self.get_parameter("top_detections_topic").value),
-            camera_frame=str(self.get_parameter("top_camera_frame").value),
-            pose_topic="/scene_localizer/top_cam/table_pose_camera",
-            min_markers_per_frame=top_min_markers,
-            estimation_mode=top_mode,
-        )
-        eef_config = StreamConfig(
-            name="eef_cam",
-            detections_topic=str(self.get_parameter("eef_detections_topic").value),
-            camera_frame=str(self.get_parameter("eef_camera_frame").value),
-            pose_topic="/scene_localizer/eef_cam/table_pose_camera",
-            min_markers_per_frame=eef_min_markers,
-            estimation_mode=eef_mode,
+        top_detections_topic = str(self.get_parameter("top_detections_topic").value)
+        self.create_subscription(
+            ArucoDetection,
+            top_detections_topic,
+            self._handle_top_detection_message,
+            10,
         )
 
-        self._streams: Dict[str, StreamState] = {}
-        for config in (top_config, eef_config):
-            layout = stream_layouts.get(config.name, {})
-            pose_pub = self.create_publisher(PoseStamped, config.pose_topic, 10)
-            state = StreamState(config=config, marker_layout=layout, pose_pub=pose_pub)
-            self._streams[config.name] = state
+        ball_trajectory_topic = str(self.get_parameter("ball_trajectory_topic").value)
+        self.create_subscription(
+            BallTrajectory,
+            ball_trajectory_topic,
+            self._handle_ball_trajectory_message,
+            10,
+        )
 
-            self.create_subscription(
-                ArucoDetection,
-                config.detections_topic,
-                self._make_detections_callback(state),
-                10,
-            )
+        ball_3d_topic = str(self.get_parameter("ball_3d_topic").value)
+        self.create_subscription(
+            PointStamped,
+            ball_3d_topic,
+            self._handle_ball_3d_point_message,
+            10,
+        )
+
+        self._top_camera_table_pose_pub = self.create_publisher(
+            PoseStamped,
+            str(self.get_parameter("top_camera_table_pose_topic").value),
+            10,
+        )
+        self._robot_base_top_camera_pose_pub = self.create_publisher(
+            PoseStamped,
+            str(self.get_parameter("robot_base_top_camera_pose_topic").value),
+            10,
+        )
+        self._robot_base_table_pose_pub = self.create_publisher(
+            PoseStamped,
+            str(self.get_parameter("robot_base_table_pose_topic").value),
+            10,
+        )
+        self._middle_line_intersection_pose_robot_base_pub = self.create_publisher(
+            PoseStamped,
+            str(self.get_parameter("middle_line_intersection_pose_robot_base_topic").value),
+            10,
+        )
 
         publish_rate_hz = max(0.1, float(self.get_parameter("publish_rate_hz").value))
         self._publish_timer = self.create_timer(1.0 / publish_rate_hz, self._publish_timer_callback)
 
         self.get_logger().info(f"Loaded marker layout YAML: {marker_layout_yaml}")
-        for stream_name, state in self._streams.items():
-            self.get_logger().info(
-                f"[{stream_name}] markers={len(state.marker_layout)}, "
-                f"sub={state.config.detections_topic}, pub={state.config.pose_topic}, "
-                f"camera_frame={state.config.camera_frame}, "
-                f"min_markers_per_frame={state.config.min_markers_per_frame}, "
-                f"estimation_mode={state.config.estimation_mode}"
-            )
-            if not state.marker_layout:
-                self._warn_throttled(
-                    f"empty_layout_{stream_name}",
-                    f"[{stream_name}] marker layout is empty; estimates will be skipped",
-                    5.0,
-                )
-
-        self._log_debug(
-            "params: "
-            f"window_sec={self.get_parameter('window_sec').value}, "
-            f"publish_rate_hz={self.get_parameter('publish_rate_hz').value}, "
-            f"min_markers_per_frame_global={self.get_parameter('min_markers_per_frame').value}, "
-            f"top_min_markers_per_frame={top_min_markers}, "
-            f"eef_min_markers_per_frame={eef_min_markers}, "
-            f"estimation_mode_global={global_mode}, "
-            f"top_estimation_mode={top_mode}, "
-            f"eef_estimation_mode={eef_mode}, "
-            f"min_estimates_in_window={self.get_parameter('min_estimates_in_window').value}, "
-            f"max_candidate_translation_deviation={self.get_parameter('max_candidate_translation_deviation').value}, "
-            f"max_window_translation_deviation={self.get_parameter('max_window_translation_deviation').value}, "
-            f"max_translation_jump={self.get_parameter('max_translation_jump').value}, "
-            f"max_rotation_jump_deg={self.get_parameter('max_rotation_jump_deg').value}, "
-            f"smoothing_alpha={self.get_parameter('smoothing_alpha').value}, "
-            f"publish_tf={self.get_parameter('publish_tf').value}"
+        self.get_logger().info(
+            f"Top-cam-only localization: sub={top_detections_topic}, "
+            f"ball_trajectory_topic={ball_trajectory_topic}, "
+            f"intersection_pose_pub={self.get_parameter('middle_line_intersection_pose_robot_base_topic').value}, "
+            f"ball_3d_topic={ball_3d_topic}, "
+            f"ball_3d_frame={self.get_parameter('ball_3d_frame').value}, "
+            f"markers={len(self._state.marker_layout)}, "
+            f"top_camera_frame={self._top_camera_frame}, "
+            f"robot_base_frame={self._robot_base_frame}, "
+            f"calibration_link_frame={self._calibration_link_frame}, "
+            f"table_frame={self._table_frame}, "
+            f"estimation_mode={self._top_estimation_mode}, "
+            f"min_markers_per_frame={self._top_min_markers}"
         )
+        if self._calibration_yaml_transform is None:
+            self.get_logger().warn(
+                "No valid base_cam_calibration_yaml loaded; robot-base transforms will not be published."
+            )
+        else:
+            cal = self._calibration_yaml_transform
+            self.get_logger().info(
+                f"Loaded calibration YAML: {self._calibration_yaml_path}; "
+                f"transform={cal.parent_frame}->{cal.child_frame}"
+            )
 
     def _log_debug(self, message: str) -> None:
         if bool(self.get_parameter("debug_log").value):
@@ -314,121 +416,187 @@ class SceneLocalizerNode(Node):
             self._last_warn_time_ns[key] = now_ns
             self.get_logger().warn(message)
 
-    def _load_layout_by_stream(self, yaml_path: str) -> Dict[str, Dict[int, TransformEstimate]]:
+    def _load_top_marker_layout(self, yaml_path: str) -> Dict[int, TransformEstimate]:
         layout_path = Path(yaml_path)
         if not layout_path.exists():
             self.get_logger().warn(f"Marker layout YAML not found: {yaml_path}")
-            return {"top_cam": {}, "eef_cam": {}}
+            return {}
 
         try:
             with layout_path.open("r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
         except Exception as exc:
             self.get_logger().warn(f"Failed to read marker layout YAML: {exc}")
-            return {"top_cam": {}, "eef_cam": {}}
+            return {}
 
-        streams_data = data.get("streams", {})
         marker_origin = str(data.get("marker_translation_origin", "bottom_left"))
         physical_marker_size = float(data.get("physical_marker_size", 0.035))
 
-        result: Dict[str, Dict[int, TransformEstimate]] = {}
-        for stream_name, stream_cfg in streams_data.items():
-            markers_data = stream_cfg.get("markers", {})
-            parsed: Dict[int, TransformEstimate] = {}
-            for marker_id_raw, marker_cfg in markers_data.items():
-                try:
-                    marker_id = int(marker_id_raw)
-                    translation = np.array(marker_cfg.get("translation", [0.0, 0.0, 0.0]), dtype=float)
-                    rpy = marker_cfg.get("rpy", [0.0, 0.0, 0.0])
-                    if translation.shape != (3,) or len(rpy) != 3:
-                        raise ValueError("translation/rpy must be length 3")
-                    rotation = _rpy_to_matrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
-                    if marker_origin in ("bottom_left", "bottom-left", "corner"):
-                        corner_to_center_marker = np.array(
-                            [0.5 * physical_marker_size, -0.5 * physical_marker_size, 0.0],
-                            dtype=float,
-                        )
-                        translation = translation + rotation @ corner_to_center_marker
-                    elif marker_origin != "center":
-                        self._warn_throttled(
-                            "unknown_marker_origin",
-                            f"Unknown marker_translation_origin '{marker_origin}', assuming center",
-                            5.0,
-                        )
-                    quaternion = _matrix_to_quaternion_xyzw(rotation)
-                    parsed[marker_id] = TransformEstimate(translation=translation, quaternion_xyzw=quaternion)
-                except Exception as exc:
+        # Preferred current format:
+        # streams:
+        #   top_cam:
+        #     markers: {...}
+        # Also accepts a flat legacy top-level `markers: {...}`.
+        streams_data = data.get("streams", {})
+        if "top_cam" in streams_data:
+            markers_data = streams_data.get("top_cam", {}).get("markers", {})
+        else:
+            markers_data = data.get("markers", {})
+
+        parsed: Dict[int, TransformEstimate] = {}
+        for marker_id_raw, marker_cfg in markers_data.items():
+            try:
+                marker_id = int(marker_id_raw)
+                translation = np.array(marker_cfg.get("translation", [0.0, 0.0, 0.0]), dtype=float)
+                rpy = marker_cfg.get("rpy", [0.0, 0.0, 0.0])
+                if translation.shape != (3,) or len(rpy) != 3:
+                    raise ValueError("translation/rpy must be length 3")
+
+                rotation = _rpy_to_matrix(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+                if marker_origin in ("bottom_left", "bottom-left", "corner"):
+                    corner_to_center_marker = np.array(
+                        [0.5 * physical_marker_size, -0.5 * physical_marker_size, 0.0],
+                        dtype=float,
+                    )
+                    translation = translation + rotation @ corner_to_center_marker
+                elif marker_origin != "center":
                     self._warn_throttled(
-                        f"parse_marker_{stream_name}_{marker_id_raw}",
-                        f"[{stream_name}] failed to parse marker {marker_id_raw}: {exc}",
+                        "unknown_marker_origin",
+                        f"Unknown marker_translation_origin '{marker_origin}', assuming center",
                         5.0,
                     )
-            result[stream_name] = parsed
 
-        if "top_cam" not in result:
-            result["top_cam"] = {}
-        if "eef_cam" not in result:
-            result["eef_cam"] = {}
-
-        total_markers = sum(len(markers) for markers in result.values())
-        stream_summaries = []
-        for stream_name in sorted(result.keys()):
-            marker_items = []
-            for marker_id in sorted(result[stream_name].keys()):
-                t = result[stream_name][marker_id].translation
-                marker_items.append(
-                    f"{marker_id}:({float(t[0]):.4f},{float(t[1]):.4f},{float(t[2]):.4f})"
+                parsed[marker_id] = TransformEstimate(
+                    translation=translation,
+                    quaternion_xyzw=_matrix_to_quaternion_xyzw(rotation),
                 )
-            stream_summaries.append(
-                f"{stream_name}:count={len(marker_items)} translations=[{', '.join(marker_items)}]"
+            except Exception as exc:
+                self._warn_throttled(
+                    f"parse_marker_top_cam_{marker_id_raw}",
+                    f"[top_cam] failed to parse marker {marker_id_raw}: {exc}",
+                    5.0,
+                )
+
+        marker_items = []
+        for marker_id in sorted(parsed.keys()):
+            t = parsed[marker_id].translation
+            marker_items.append(
+                f"{marker_id}:({float(t[0]):.4f},{float(t[1]):.4f},{float(t[2]):.4f})"
             )
         self.get_logger().info(
-            "Loaded layout summary: "
-            f"streams={len(result)} total_markers={total_markers} "
-            f"marker_translation_origin={marker_origin} physical_marker_size={physical_marker_size:.4f}; "
-            + "; ".join(stream_summaries)
+            "Loaded top_cam layout summary: "
+            f"count={len(parsed)} marker_translation_origin={marker_origin} "
+            f"physical_marker_size={physical_marker_size:.4f} "
+            f"translations=[{', '.join(marker_items)}]"
         )
+        return parsed
 
-        return result
+    def _load_calibration_yaml(self, yaml_path: str) -> Optional[CalibrationYamlTransform]:
+        if not yaml_path:
+            return None
 
-    def _make_detections_callback(self, state: StreamState):
-        def _callback(msg: ArucoDetection) -> None:
-            self._handle_detection_message(state, msg)
+        path = Path(yaml_path)
+        if not path.exists():
+            self.get_logger().warn(f"Calibration YAML not found: {yaml_path}")
+            return None
 
-        return _callback
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to read calibration YAML '{yaml_path}': {exc}")
+            return None
 
-    def _handle_detection_message(self, state: StreamState, msg: ArucoDetection) -> None:
-        markers = self._extract_markers_from_msg(msg)
-        self._log_debug(f"[{state.config.name}] received detections message with markers={len(markers)}")
-        if not markers:
-            self._warn_throttled(
-                f"no_markers_{state.config.name}",
-                f"[{state.config.name}] no markers in ArUco detection message",
-                1.0,
+        try:
+            parent_frame = _clean_frame(data.get("parent_frame", ""))
+            child_frame = _clean_frame(data.get("child_frame", ""))
+            if not parent_frame or not child_frame:
+                raise ValueError("YAML must contain parent_frame and child_frame")
+
+            translation = self._parse_translation(data.get("translation", [0.0, 0.0, 0.0]))
+            if "quaternion" in data:
+                quaternion = self._parse_quaternion(data.get("quaternion"))
+            elif "quaternion_xyzw" in data:
+                quaternion = self._parse_quaternion(data.get("quaternion_xyzw"))
+            elif "rotation_matrix" in data:
+                rotation = np.array(data.get("rotation_matrix"), dtype=float)
+                if rotation.shape != (3, 3):
+                    raise ValueError("rotation_matrix must be 3x3")
+                quaternion = _matrix_to_quaternion_xyzw(rotation)
+            else:
+                raise ValueError("YAML must contain quaternion, quaternion_xyzw, or rotation_matrix")
+
+            return CalibrationYamlTransform(
+                parent_frame=parent_frame,
+                child_frame=child_frame,
+                estimate=TransformEstimate(
+                    translation=translation,
+                    quaternion_xyzw=_normalize_quaternion_xyzw(quaternion),
+                ),
             )
+        except Exception as exc:
+            self.get_logger().warn(f"Invalid calibration YAML '{yaml_path}': {exc}")
+            return None
+
+    @staticmethod
+    def _parse_translation(raw: Any) -> np.ndarray:
+        if isinstance(raw, dict):
+            return np.array([raw["x"], raw["y"], raw["z"]], dtype=float)
+        arr = np.array(raw, dtype=float)
+        if arr.shape != (3,):
+            raise ValueError("translation must be dict {x,y,z} or length-3 list")
+        return arr
+
+    @staticmethod
+    def _parse_quaternion(raw: Any) -> np.ndarray:
+        if isinstance(raw, dict):
+            return np.array([raw["x"], raw["y"], raw["z"], raw["w"]], dtype=float)
+        arr = np.array(raw, dtype=float)
+        if arr.shape != (4,):
+            raise ValueError("quaternion must be dict {x,y,z,w} or length-4 list")
+        return arr
+
+    def _handle_ball_trajectory_message(self, msg: BallTrajectory) -> None:
+        self._latest_ball_trajectory = msg
+        self._latest_ball_trajectory_time_sec = self._stamp_to_sec(msg)
+
+    def _handle_ball_3d_point_message(self, msg: PointStamped) -> None:
+        self._latest_ball_3d_point = msg
+        self._latest_ball_3d_point_time_sec = self._stamp_to_sec(msg)
+        self._publish_table_ball_3d_tf_if_available()
+
+    def _handle_top_detection_message(self, msg: ArucoDetection) -> None:
+        markers = self._extract_markers_from_msg(msg)
+        self._log_debug(f"[top_cam] received detections message with markers={len(markers)}")
+        if not markers:
+            self._warn_throttled("no_markers_top_cam", "[top_cam] no markers in ArUco detection message", 1.0)
             return
 
-        if not state.marker_layout:
+        if not self._state.marker_layout:
             self._warn_throttled(
-                f"no_layout_{state.config.name}",
-                f"[{state.config.name}] marker layout empty; skipping detections",
+                "no_layout_top_cam",
+                "[top_cam] marker layout empty; skipping detections",
                 2.0,
             )
             return
 
-        max_translation_jump = max(0.0, float(self.get_parameter("max_translation_jump").value))
-        max_rotation_jump_deg = max(0.0, float(self.get_parameter("max_rotation_jump_deg").value))
+        if _clean_frame(getattr(msg.header, "frame_id", "")) and _clean_frame(msg.header.frame_id) != self._top_camera_frame:
+            self._warn_throttled(
+                "top_detection_frame_mismatch",
+                f"[top_cam] detection frame_id='{msg.header.frame_id}' differs from "
+                f"top_camera_frame='{self._top_camera_frame}'. Using the poses as-is; "
+                "fix the parameter if this is not intentional.",
+                2.0,
+            )
 
-        frame_estimate: Optional[TransformEstimate] = None
-        if state.config.estimation_mode == "marker_pose_average":
-            frame_estimate = self._estimate_frame_marker_pose_average(state, markers)
-        elif state.config.estimation_mode == "marker_center_alignment":
-            frame_estimate = self._estimate_frame_marker_center_alignment(state, markers)
+        if self._top_estimation_mode == "marker_pose_average":
+            frame_estimate = self._estimate_frame_marker_pose_average(markers)
+        elif self._top_estimation_mode == "marker_center_alignment":
+            frame_estimate = self._estimate_frame_marker_center_alignment(markers)
         else:
             self._warn_throttled(
-                f"invalid_mode_{state.config.name}",
-                f"[{state.config.name}] invalid estimation_mode='{state.config.estimation_mode}', "
-                "skipping estimates for this stream",
+                "invalid_mode_top_cam",
+                f"[top_cam] invalid estimation_mode='{self._top_estimation_mode}', skipping estimates",
                 2.0,
             )
             return
@@ -436,43 +604,37 @@ class SceneLocalizerNode(Node):
         if frame_estimate is None:
             return
 
-        if state.last_accepted_estimate is not None:
-            dt = float(np.linalg.norm(frame_estimate.translation - state.last_accepted_estimate.translation))
+        max_translation_jump = max(0.0, float(self.get_parameter("max_translation_jump").value))
+        max_rotation_jump_deg = max(0.0, float(self.get_parameter("max_rotation_jump_deg").value))
+        if self._state.last_accepted_estimate is not None:
+            dt = float(np.linalg.norm(frame_estimate.translation - self._state.last_accepted_estimate.translation))
             dq = _quaternion_angular_distance_deg(
                 frame_estimate.quaternion_xyzw,
-                state.last_accepted_estimate.quaternion_xyzw,
+                self._state.last_accepted_estimate.quaternion_xyzw,
             )
             if dt > max_translation_jump or dq > max_rotation_jump_deg:
-                self._log_debug(
-                    f"[{state.config.name}] jump reject details dt={dt:.4f}m dq={dq:.3f}deg "
-                    f"thresholds=({max_translation_jump:.4f}m, {max_rotation_jump_deg:.3f}deg)"
-                )
                 self._warn_throttled(
-                    f"jump_reject_{state.config.name}",
-                    f"[{state.config.name}] rejected jump: dt={dt:.3f}m dq={dq:.1f}deg",
+                    "jump_reject_top_cam",
+                    f"[top_cam] rejected jump: dt={dt:.3f}m dq={dq:.1f}deg",
                     1.0,
                 )
                 return
 
         stamp_sec = self._stamp_to_sec(msg)
-        state.last_source_stamp_sec = stamp_sec
-        state.last_accepted_estimate = frame_estimate
-        state.buffer.append(TimedEstimate(stamp_sec=stamp_sec, estimate=frame_estimate))
-        self._prune_buffer(state)
+        self._state.last_source_stamp_sec = stamp_sec
+        self._state.last_accepted_estimate = frame_estimate
+        self._state.buffer.append(TimedEstimate(stamp_sec=stamp_sec, estimate=frame_estimate))
+        self._prune_buffer()
+
         self._log_debug(
-            f"[{state.config.name}] accepted frame estimate "
+            f"[top_cam] accepted T_top_camera_table "
             f"t=({frame_estimate.translation[0]:.4f}, {frame_estimate.translation[1]:.4f}, {frame_estimate.translation[2]:.4f}) "
             f"q=({frame_estimate.quaternion_xyzw[0]:.4f}, {frame_estimate.quaternion_xyzw[1]:.4f}, "
             f"{frame_estimate.quaternion_xyzw[2]:.4f}, {frame_estimate.quaternion_xyzw[3]:.4f}) "
-            f"mode={state.config.estimation_mode} buffer_size={len(state.buffer)}"
+            f"mode={self._top_estimation_mode} buffer_size={len(self._state.buffer)}"
         )
 
-    def _estimate_frame_marker_pose_average(
-        self,
-        state: StreamState,
-        markers: List[Any],
-    ) -> Optional[TransformEstimate]:
-        min_markers = max(1, int(state.config.min_markers_per_frame))
+    def _estimate_frame_marker_pose_average(self, markers: List[Any]) -> Optional[TransformEstimate]:
         max_candidate_dev = max(0.0, float(self.get_parameter("max_candidate_translation_deviation").value))
 
         candidate_translations: List[np.ndarray] = []
@@ -481,7 +643,7 @@ class SceneLocalizerNode(Node):
 
         for marker in markers:
             marker_id = self._extract_marker_id(marker)
-            if marker_id is None or marker_id not in state.marker_layout:
+            if marker_id is None or marker_id not in self._state.marker_layout:
                 continue
 
             pose = self._extract_pose_from_marker(marker)
@@ -490,73 +652,49 @@ class SceneLocalizerNode(Node):
 
             t_cm = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
             q_cm = np.array(
-                [
-                    pose.orientation.x,
-                    pose.orientation.y,
-                    pose.orientation.z,
-                    pose.orientation.w,
-                ],
+                [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w],
                 dtype=float,
             )
             r_cm = _quaternion_to_matrix_xyzw(q_cm)
 
-            table_marker = state.marker_layout[marker_id]
+            table_marker = self._state.marker_layout[marker_id]
             t_tm = table_marker.translation
             r_tm = _quaternion_to_matrix_xyzw(table_marker.quaternion_xyzw)
 
             # T_camera_table = T_camera_marker * inverse(T_table_marker)
-            t_mt, r_mt = _invert_transform(t_tm, r_tm)
-            t_ct, r_ct = _compose_transform(t_cm, r_cm, t_mt, r_mt)
+            t_mt = -r_tm.T @ t_tm
+            r_mt = r_tm.T
+            t_ct = t_cm + r_cm @ t_mt
+            r_ct = r_cm @ r_mt
             q_ct = _matrix_to_quaternion_xyzw(r_ct)
-
-            self._log_debug(
-                f"[{state.config.name}] marker_id={marker_id} "
-                f"candidate_t=({t_ct[0]:.4f}, {t_ct[1]:.4f}, {t_ct[2]:.4f})"
-            )
 
             candidate_translations.append(t_ct)
             candidate_quaternions.append(q_ct)
             used_marker_ids.append(marker_id)
 
-        if used_marker_ids:
-            self._log_debug(
-                f"[{state.config.name}] usable markers={used_marker_ids}, "
-                f"candidate_count={len(candidate_translations)}"
-            )
-
-        if len(candidate_translations) < min_markers:
+        if len(candidate_translations) < self._top_min_markers:
             self._warn_throttled(
-                f"too_few_markers_{state.config.name}",
-                f"[{state.config.name}] usable markers below minimum ({len(candidate_translations)} < {min_markers})",
+                "too_few_markers_top_cam",
+                f"[top_cam] usable markers below minimum ({len(candidate_translations)} < {self._top_min_markers})",
                 1.0,
             )
             return None
 
         kept_idx = self._reject_translation_outliers(candidate_translations, max_candidate_dev)
-        self._log_debug(
-            f"[{state.config.name}] candidate filter kept={len(kept_idx)}/{len(candidate_translations)}"
-        )
         if not kept_idx:
             self._warn_throttled(
-                f"candidate_reject_all_{state.config.name}",
-                f"[{state.config.name}] rejected all frame candidates as outliers",
+                "candidate_reject_all_top_cam",
+                "[top_cam] rejected all frame candidates as outliers",
                 1.0,
             )
             return None
 
         frame_t = np.mean(np.stack([candidate_translations[i] for i in kept_idx], axis=0), axis=0)
         frame_q = _average_quaternions_xyzw([candidate_quaternions[i] for i in kept_idx])
-        self._log_debug(
-            f"[{state.config.name}] pose-average candidates={len(kept_idx)}/{len(candidate_translations)}"
-        )
+        self._log_debug(f"[top_cam] pose-average used markers={used_marker_ids} kept={len(kept_idx)}")
         return TransformEstimate(translation=frame_t, quaternion_xyzw=frame_q)
 
-    def _estimate_frame_marker_center_alignment(
-        self,
-        state: StreamState,
-        markers: List[Any],
-    ) -> Optional[TransformEstimate]:
-        min_markers = max(1, int(state.config.min_markers_per_frame))
+    def _estimate_frame_marker_center_alignment(self, markers: List[Any]) -> Optional[TransformEstimate]:
         max_candidate_dev = max(0.0, float(self.get_parameter("max_candidate_translation_deviation").value))
 
         table_points: List[np.ndarray] = []
@@ -565,33 +703,29 @@ class SceneLocalizerNode(Node):
 
         for marker in markers:
             marker_id = self._extract_marker_id(marker)
-            if marker_id is None or marker_id not in state.marker_layout:
+            if marker_id is None or marker_id not in self._state.marker_layout:
                 continue
 
             pose = self._extract_pose_from_marker(marker)
             if pose is None:
                 continue
 
-            p_camera = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
-            p_table = state.marker_layout[marker_id].translation
-
-            camera_points.append(p_camera)
-            table_points.append(p_table)
+            camera_points.append(np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float))
+            table_points.append(self._state.marker_layout[marker_id].translation)
             used_marker_ids.append(marker_id)
 
-        if len(camera_points) < min_markers:
+        if len(camera_points) < self._top_min_markers:
             self._warn_throttled(
-                f"too_few_markers_{state.config.name}",
-                f"[{state.config.name}] usable markers below minimum ({len(camera_points)} < {min_markers})",
+                "too_few_markers_top_cam",
+                f"[top_cam] usable markers below minimum ({len(camera_points)} < {self._top_min_markers})",
                 1.0,
             )
             return None
 
         if len(camera_points) < 3:
             self._warn_throttled(
-                f"too_few_markers_alignment_{state.config.name}",
-                f"[{state.config.name}] marker_center_alignment needs at least 3 markers "
-                f"({len(camera_points)} available)",
+                "too_few_markers_alignment_top_cam",
+                f"[top_cam] marker_center_alignment needs at least 3 markers ({len(camera_points)} available)",
                 1.0,
             )
             return None
@@ -612,29 +746,448 @@ class SceneLocalizerNode(Node):
             r = vt.T @ u.T
 
         t = q_mean - r @ p_mean
-        q_ct = _matrix_to_quaternion_xyzw(r)
-
         residuals = q - (r @ p.T).T - t
         rms = float(np.sqrt(np.mean(np.sum(residuals * residuals, axis=1))))
-
-        self._log_debug(
-            f"[{state.config.name}] center-alignment used markers={used_marker_ids} rms={rms:.5f}m"
-        )
         if rms > max_candidate_dev:
             self._warn_throttled(
-                f"alignment_rms_high_{state.config.name}",
-                f"[{state.config.name}] center-alignment RMS residual high: {rms:.4f}m "
+                "alignment_rms_high_top_cam",
+                f"[top_cam] center-alignment RMS residual high: {rms:.4f}m "
                 f"(threshold={max_candidate_dev:.4f}m)",
                 1.0,
             )
 
-        return TransformEstimate(translation=t, quaternion_xyzw=q_ct)
+        self._log_debug(f"[top_cam] center-alignment used markers={used_marker_ids} rms={rms:.5f}m")
+        return TransformEstimate(translation=t, quaternion_xyzw=_matrix_to_quaternion_xyzw(r))
 
-    def _prune_buffer(self, state: StreamState) -> None:
+    def _publish_timer_callback(self) -> None:
+        self._prune_buffer()
+        top_camera_table = self._compute_smoothed_top_camera_table()
+        if top_camera_table is None:
+            return
+
+        stamp = self._estimate_stamp_msg()
+        self._publish_pose(
+            self._top_camera_table_pose_pub,
+            top_camera_table,
+            self._top_camera_frame,
+            stamp,
+        )
+
+        robot_base_top_camera = self._compute_robot_base_top_camera()
+        if robot_base_top_camera is None:
+            return
+
+        self._last_robot_base_top_camera = robot_base_top_camera
+        self._publish_pose(
+            self._robot_base_top_camera_pose_pub,
+            robot_base_top_camera,
+            self._robot_base_frame,
+            stamp,
+        )
+
+        t_base_cam = _estimate_to_matrix(robot_base_top_camera)
+        t_cam_table = _estimate_to_matrix(top_camera_table)
+        robot_base_table = _matrix_to_estimate(t_base_cam @ t_cam_table)
+        self._last_robot_base_table = robot_base_table
+
+        self._publish_pose(
+            self._robot_base_table_pose_pub,
+            robot_base_table,
+            self._robot_base_frame,
+            stamp,
+        )
+
+        self._publish_middle_line_intersection_pose_if_available(robot_base_table)
+        self._publish_table_ball_3d_tf_if_available()
+
+        self._publish_tfs_if_enabled(stamp, robot_base_top_camera, top_camera_table, robot_base_table)
+
+    def _compute_smoothed_top_camera_table(self) -> Optional[TransformEstimate]:
+        min_in_window = max(1, int(self.get_parameter("min_estimates_in_window").value))
+        max_window_dev = max(0.0, float(self.get_parameter("max_window_translation_deviation").value))
+        smoothing_alpha = min(1.0, max(0.0, float(self.get_parameter("smoothing_alpha").value)))
+
+        if len(self._state.buffer) < min_in_window:
+            self._warn_throttled(
+                "too_few_window_top_cam",
+                f"[top_cam] too few estimates in window ({len(self._state.buffer)} < {min_in_window})",
+                1.0,
+            )
+            return None
+
+        translations = [item.estimate.translation for item in self._state.buffer]
+        quaternions = [item.estimate.quaternion_xyzw for item in self._state.buffer]
+        keep_idx = self._reject_translation_outliers(translations, max_window_dev)
+        if len(keep_idx) < min_in_window:
+            self._warn_throttled(
+                "window_outlier_top_cam",
+                f"[top_cam] window outlier rejection left too few estimates ({len(keep_idx)} < {min_in_window})",
+                1.0,
+            )
+            return None
+
+        avg_t = np.mean(np.stack([translations[i] for i in keep_idx], axis=0), axis=0)
+        avg_q = _average_quaternions_xyzw([quaternions[i] for i in keep_idx])
+        current = TransformEstimate(translation=avg_t, quaternion_xyzw=avg_q)
+
+        if self._state.last_published_estimate is not None:
+            smoothed_t = (
+                (1.0 - smoothing_alpha) * self._state.last_published_estimate.translation
+                + smoothing_alpha * current.translation
+            )
+            smoothed_q = _blend_quaternions_xyzw(
+                self._state.last_published_estimate.quaternion_xyzw,
+                current.quaternion_xyzw,
+                smoothing_alpha,
+            )
+            current = TransformEstimate(translation=smoothed_t, quaternion_xyzw=smoothed_q)
+
+        self._state.last_published_estimate = current
+        return current
+
+    def _compute_robot_base_top_camera(self) -> Optional[TransformEstimate]:
+        cal = self._calibration_yaml_transform
+        if cal is None:
+            return None
+
+        parent = _clean_frame(cal.parent_frame)
+        child = _clean_frame(cal.child_frame)
+        robot_base = self._robot_base_frame
+        top_cam = self._top_camera_frame
+        calibration_link = self._calibration_link_frame
+        t_parent_child = _estimate_to_matrix(cal.estimate)
+
+        # Case 1: calibration file already contains T_robot_base_top_camera.
+        if parent == robot_base and child == top_cam:
+            return cal.estimate
+
+        # Case 2: calibration file contains inverse, T_top_camera_robot_base.
+        if parent == top_cam and child == robot_base:
+            return _matrix_to_estimate(_invert_matrix(t_parent_child))
+
+        # Case 3: calibration file contains T_calibration_link_top_camera.
+        if parent == calibration_link and child == top_cam:
+            t_base_link = self._lookup_robot_base_to_calibration_link()
+            if t_base_link is None:
+                return None
+            return _matrix_to_estimate(t_base_link @ t_parent_child)
+
+        # Case 4: calibration file contains T_top_camera_calibration_link.
+        if parent == top_cam and child == calibration_link:
+            t_base_link = self._lookup_robot_base_to_calibration_link()
+            if t_base_link is None:
+                return None
+            t_link_cam = _invert_matrix(t_parent_child)
+            return _matrix_to_estimate(t_base_link @ t_link_cam)
+
+        self._warn_throttled(
+            "unsupported_calibration_yaml_frames",
+            "Unsupported calibration YAML frames: "
+            f"{parent}->{child}. Expected one of: "
+            f"{robot_base}->{top_cam}, {top_cam}->{robot_base}, "
+            f"{calibration_link}->{top_cam}, {top_cam}->{calibration_link}.",
+            5.0,
+        )
+        return None
+
+    def _lookup_robot_base_to_calibration_link(self) -> Optional[np.ndarray]:
+        try:
+            msg = self._tf_buffer.lookup_transform(
+                self._robot_base_frame,
+                self._calibration_link_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException as exc:
+            self._warn_throttled(
+                "lookup_base_to_calibration_link_failed",
+                f"Failed to lookup TF {self._robot_base_frame}->{self._calibration_link_frame}: {exc}",
+                1.0,
+            )
+            return None
+        return _transform_stamped_to_matrix(msg)
+
+    def _publish_pose(
+        self,
+        publisher: Any,
+        estimate: TransformEstimate,
+        frame_id: str,
+        stamp: Any,
+    ) -> None:
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = stamp
+        pose_msg.header.frame_id = frame_id
+        pose_msg.pose.position.x = float(estimate.translation[0])
+        pose_msg.pose.position.y = float(estimate.translation[1])
+        pose_msg.pose.position.z = float(estimate.translation[2])
+        pose_msg.pose.orientation.x = float(estimate.quaternion_xyzw[0])
+        pose_msg.pose.orientation.y = float(estimate.quaternion_xyzw[1])
+        pose_msg.pose.orientation.z = float(estimate.quaternion_xyzw[2])
+        pose_msg.pose.orientation.w = float(estimate.quaternion_xyzw[3])
+        publisher.publish(pose_msg)
+
+    def _publish_table_ball_3d_tf_if_available(self) -> None:
+        if not bool(self.get_parameter("publish_tf").value):
+            return
+        if not bool(self.get_parameter("publish_table_ball_3d_tf").value):
+            return
+
+        ball_msg = self._latest_ball_3d_point
+        if ball_msg is None or self._latest_ball_3d_point_time_sec is None:
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        timeout_sec = max(0.0, float(self.get_parameter("ball_3d_timeout_sec").value))
+        age_sec = now_sec - self._latest_ball_3d_point_time_sec
+        if age_sec > timeout_sec:
+            self._warn_throttled(
+                "ball_3d_tf_stale",
+                f"Not publishing table->ball_3d TF: ball point stale "
+                f"age={age_sec:.3f}s timeout={timeout_sec:.3f}s",
+                1.0,
+            )
+            return
+
+        ball_frame = _clean_frame(getattr(getattr(ball_msg, "header", None), "frame_id", ""))
+        accepted_frames = {_clean_frame(self._table_frame), "table", "table_frame"}
+        if ball_frame and ball_frame not in accepted_frames:
+            self._warn_throttled(
+                "ball_3d_tf_frame_mismatch",
+                f"Not publishing table->ball_3d TF: ball point frame_id='{ball_frame}' "
+                f"does not match table_frame='{self._table_frame}'",
+                1.0,
+            )
+            return
+
+        p_ball_table = np.array(
+            [
+                float(getattr(ball_msg.point, "x", float("nan"))),
+                float(getattr(ball_msg.point, "y", float("nan"))),
+                float(getattr(ball_msg.point, "z", float("nan"))),
+            ],
+            dtype=float,
+        )
+        if not _is_finite_vector(p_ball_table):
+            self._warn_throttled(
+                "ball_3d_tf_non_finite",
+                f"Not publishing table->ball_3d TF: non-finite point={p_ball_table.tolist()}",
+                1.0,
+            )
+            return
+
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = self.get_clock().now().to_msg()
+        tf_msg.header.frame_id = self._table_frame
+        tf_msg.child_frame_id = _clean_frame(self.get_parameter("ball_3d_frame").value)
+        tf_msg.transform.translation.x = float(p_ball_table[0])
+        tf_msg.transform.translation.y = float(p_ball_table[1])
+        tf_msg.transform.translation.z = float(p_ball_table[2])
+        tf_msg.transform.rotation.x = 0.0
+        tf_msg.transform.rotation.y = 0.0
+        tf_msg.transform.rotation.z = 0.0
+        tf_msg.transform.rotation.w = 1.0
+        self._tf_broadcaster.sendTransform(tf_msg)
+
+    def _publish_middle_line_intersection_pose_if_available(
+        self,
+        robot_base_table: TransformEstimate,
+    ) -> None:
+        if not bool(self.get_parameter("publish_middle_line_intersection_pose_robot_base").value):
+            return
+
+        traj = self._latest_ball_trajectory
+        if traj is None or self._latest_ball_trajectory_time_sec is None:
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        timeout_sec = max(0.0, float(self.get_parameter("trajectory_timeout_sec").value))
+        age_sec = now_sec - self._latest_ball_trajectory_time_sec
+        if age_sec > timeout_sec:
+            self._warn_throttled(
+                "middle_intersection_trajectory_stale",
+                f"Not publishing middle-line intersection pose: trajectory stale "
+                f"age={age_sec:.3f}s timeout={timeout_sec:.3f}s",
+                1.0,
+            )
+            return
+
+        if not bool(getattr(traj, "valid", False)):
+            return
+
+        traj_frame = _clean_frame(getattr(getattr(traj, "header", None), "frame_id", ""))
+        accepted_frames = {_clean_frame(self._table_frame), "table", "table_frame"}
+        if traj_frame and traj_frame not in accepted_frames:
+            self._warn_throttled(
+                "middle_intersection_traj_frame_mismatch",
+                f"Not publishing middle-line intersection pose: trajectory frame_id='{traj_frame}' "
+                f"does not match table_frame='{self._table_frame}'",
+                1.0,
+            )
+            return
+
+        end_point = getattr(traj, "end_point", None)
+        if end_point is None:
+            self._warn_throttled(
+                "middle_intersection_missing_end_point",
+                "Not publishing middle-line intersection pose: BallTrajectory.end_point missing",
+                1.0,
+            )
+            return
+
+        p_hit_table = np.array(
+            [
+                float(getattr(end_point, "x", float("nan"))),
+                float(getattr(end_point, "y", float("nan"))),
+                float(getattr(end_point, "z", float("nan"))),
+            ],
+            dtype=float,
+        )
+        if not _is_finite_vector(p_hit_table):
+            self._warn_throttled(
+                "middle_intersection_non_finite",
+                f"Not publishing middle-line intersection pose: non-finite end_point={p_hit_table.tolist()}",
+                1.0,
+            )
+            return
+
+        T_base_table = _estimate_to_matrix(robot_base_table)
+        p_hit_base = _transform_point(T_base_table, p_hit_table)
+        if not _is_finite_vector(p_hit_base):
+            self._warn_throttled(
+                "middle_intersection_base_non_finite",
+                f"Not publishing middle-line intersection pose: transformed point non-finite={p_hit_base.tolist()}",
+                1.0,
+            )
+            return
+
+        pose_msg = PoseStamped()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = self._robot_base_frame
+        pose_msg.pose.position.x = float(p_hit_base[0])
+        pose_msg.pose.position.y = float(p_hit_base[1])
+        pose_msg.pose.position.z = float(p_hit_base[2])
+
+        q_base_target = self._intersection_pose_quaternion_xyzw()
+        pose_msg.pose.orientation.x = float(q_base_target[0])
+        pose_msg.pose.orientation.y = float(q_base_target[1])
+        pose_msg.pose.orientation.z = float(q_base_target[2])
+        pose_msg.pose.orientation.w = float(q_base_target[3])
+
+        self._middle_line_intersection_pose_robot_base_pub.publish(pose_msg)
+
+    def _intersection_pose_quaternion_xyzw(self) -> np.ndarray:
+        mode = str(self.get_parameter("intersection_pose_orientation_mode").value).strip().lower()
+        if mode in {"identity", "base_identity", "robot_base_identity"}:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+
+        if mode not in {"tcp_current", "current_tcp", "tcp"}:
+            self._warn_throttled(
+                "invalid_intersection_pose_orientation_mode",
+                f"Invalid intersection_pose_orientation_mode='{mode}', using tcp_current",
+                2.0,
+            )
+
+        tcp_frame = _clean_frame(self.get_parameter("tcp_frame").value)
+        try:
+            tf_msg = self._tf_buffer.lookup_transform(
+                self._robot_base_frame,
+                tcp_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.05),
+            )
+        except TransformException as exc:
+            self._warn_throttled(
+                "lookup_base_to_tcp_for_intersection_pose_failed",
+                f"Failed to lookup TF {self._robot_base_frame}->{tcp_frame} for intersection pose orientation; "
+                f"using identity orientation: {exc}",
+                1.0,
+            )
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+
+        q = tf_msg.transform.rotation
+        return _normalize_quaternion_xyzw(
+            np.array([q.x, q.y, q.z, q.w], dtype=float)
+        )
+
+    def _publish_tfs_if_enabled(
+        self,
+        stamp: Any,
+        robot_base_top_camera: TransformEstimate,
+        top_camera_table: TransformEstimate,
+        robot_base_table: TransformEstimate,
+    ) -> None:
+        if not bool(self.get_parameter("publish_tf").value):
+            return
+
+        transforms: List[TransformStamped] = []
+
+        if bool(self.get_parameter("publish_robot_base_top_camera_tf").value):
+            transforms.append(
+                self._make_tf_msg(
+                    robot_base_top_camera,
+                    self._robot_base_frame,
+                    self._top_camera_frame,
+                    stamp,
+                )
+            )
+
+        if bool(self.get_parameter("publish_robot_base_table_tf").value):
+            transforms.append(
+                self._make_tf_msg(
+                    robot_base_table,
+                    self._robot_base_frame,
+                    self._table_frame,
+                    stamp,
+                )
+            )
+
+        if bool(self.get_parameter("publish_top_camera_table_tf").value):
+            transforms.append(
+                self._make_tf_msg(
+                    top_camera_table,
+                    self._top_camera_frame,
+                    _clean_frame(self.get_parameter("top_camera_table_tf_child_frame").value),
+                    stamp,
+                )
+            )
+
+        if transforms:
+            self._tf_broadcaster.sendTransform(transforms)
+
+    @staticmethod
+    def _make_tf_msg(
+        estimate: TransformEstimate,
+        parent_frame: str,
+        child_frame: str,
+        stamp: Any,
+    ) -> TransformStamped:
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = parent_frame
+        tf_msg.child_frame_id = child_frame
+        tf_msg.transform.translation.x = float(estimate.translation[0])
+        tf_msg.transform.translation.y = float(estimate.translation[1])
+        tf_msg.transform.translation.z = float(estimate.translation[2])
+        tf_msg.transform.rotation.x = float(estimate.quaternion_xyzw[0])
+        tf_msg.transform.rotation.y = float(estimate.quaternion_xyzw[1])
+        tf_msg.transform.rotation.z = float(estimate.quaternion_xyzw[2])
+        tf_msg.transform.rotation.w = float(estimate.quaternion_xyzw[3])
+        return tf_msg
+
+    def _estimate_stamp_msg(self):
+        if self._state.last_source_stamp_sec is not None and self._state.last_source_stamp_sec > 0.0:
+            stamp_nsec = int(self._state.last_source_stamp_sec * 1e9)
+            stamp = self.get_clock().now().to_msg()
+            stamp.sec = int(stamp_nsec // 1_000_000_000)
+            stamp.nanosec = int(stamp_nsec % 1_000_000_000)
+            return stamp
+        return self.get_clock().now().to_msg()
+
+    def _prune_buffer(self) -> None:
         window_sec = max(0.1, float(self.get_parameter("window_sec").value))
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         cutoff = now_sec - window_sec
-        state.buffer = [item for item in state.buffer if item.stamp_sec >= cutoff]
+        self._state.buffer = [item for item in self._state.buffer if item.stamp_sec >= cutoff]
 
     @staticmethod
     def _reject_translation_outliers(translations: List[np.ndarray], max_deviation: float) -> List[int]:
@@ -644,95 +1197,6 @@ class SceneLocalizerNode(Node):
         median = np.median(arr, axis=0)
         distances = np.linalg.norm(arr - median, axis=1)
         return [int(i) for i, d in enumerate(distances) if float(d) <= max_deviation]
-
-    def _publish_timer_callback(self) -> None:
-        for state in self._streams.values():
-            self._prune_buffer(state)
-            self._publish_stream_pose(state)
-
-    def _publish_stream_pose(self, state: StreamState) -> None:
-        min_in_window = max(1, int(self.get_parameter("min_estimates_in_window").value))
-        max_window_dev = max(0.0, float(self.get_parameter("max_window_translation_deviation").value))
-        smoothing_alpha = float(self.get_parameter("smoothing_alpha").value)
-        smoothing_alpha = min(1.0, max(0.0, smoothing_alpha))
-        publish_tf = bool(self.get_parameter("publish_tf").value)
-
-        if len(state.buffer) < min_in_window:
-            self._warn_throttled(
-                f"too_few_window_{state.config.name}",
-                f"[{state.config.name}] too few estimates in window ({len(state.buffer)} < {min_in_window})",
-                1.0,
-            )
-            return
-
-        translations = [item.estimate.translation for item in state.buffer]
-        quaternions = [item.estimate.quaternion_xyzw for item in state.buffer]
-        keep_idx = self._reject_translation_outliers(translations, max_window_dev)
-        self._log_debug(
-            f"[{state.config.name}] window filter kept={len(keep_idx)}/{len(state.buffer)} "
-            f"(min={min_in_window}, max_dev={max_window_dev:.4f})"
-        )
-        if len(keep_idx) < min_in_window:
-            self._warn_throttled(
-                f"window_outlier_{state.config.name}",
-                f"[{state.config.name}] window outlier rejection left too few estimates ({len(keep_idx)} < {min_in_window})",
-                1.0,
-            )
-            return
-
-        avg_t = np.mean(np.stack([translations[i] for i in keep_idx], axis=0), axis=0)
-        avg_q = _average_quaternions_xyzw([quaternions[i] for i in keep_idx])
-
-        current = TransformEstimate(translation=avg_t, quaternion_xyzw=avg_q)
-        if state.last_published_estimate is not None:
-            smoothed_t = (
-                (1.0 - smoothing_alpha) * state.last_published_estimate.translation
-                + smoothing_alpha * current.translation
-            )
-            smoothed_q = _blend_quaternions_xyzw(
-                state.last_published_estimate.quaternion_xyzw,
-                current.quaternion_xyzw,
-                smoothing_alpha,
-            )
-            current = TransformEstimate(translation=smoothed_t, quaternion_xyzw=smoothed_q)
-
-        state.last_published_estimate = current
-
-        pose_msg = PoseStamped()
-        if state.last_source_stamp_sec is not None and state.last_source_stamp_sec > 0.0:
-            stamp_nsec = int(state.last_source_stamp_sec * 1e9)
-            pose_msg.header.stamp.sec = int(stamp_nsec // 1_000_000_000)
-            pose_msg.header.stamp.nanosec = int(stamp_nsec % 1_000_000_000)
-        else:
-            pose_msg.header.stamp = self.get_clock().now().to_msg()
-
-        pose_msg.header.frame_id = state.config.camera_frame
-        pose_msg.pose.position.x = float(current.translation[0])
-        pose_msg.pose.position.y = float(current.translation[1])
-        pose_msg.pose.position.z = float(current.translation[2])
-        pose_msg.pose.orientation.x = float(current.quaternion_xyzw[0])
-        pose_msg.pose.orientation.y = float(current.quaternion_xyzw[1])
-        pose_msg.pose.orientation.z = float(current.quaternion_xyzw[2])
-        pose_msg.pose.orientation.w = float(current.quaternion_xyzw[3])
-        state.pose_pub.publish(pose_msg)
-        self._log_debug(
-            f"[{state.config.name}] published pose frame={pose_msg.header.frame_id} "
-            f"stamp={pose_msg.header.stamp.sec}.{pose_msg.header.stamp.nanosec:09d} "
-            f"t=({pose_msg.pose.position.x:.4f}, {pose_msg.pose.position.y:.4f}, {pose_msg.pose.position.z:.4f})"
-        )
-
-        if publish_tf:
-            tf_msg = TransformStamped()
-            tf_msg.header = pose_msg.header
-            tf_msg.child_frame_id = f"{state.config.name}_{self._table_frame}"
-            tf_msg.transform.translation.x = pose_msg.pose.position.x
-            tf_msg.transform.translation.y = pose_msg.pose.position.y
-            tf_msg.transform.translation.z = pose_msg.pose.position.z
-            tf_msg.transform.rotation = pose_msg.pose.orientation
-            self._tf_broadcaster.sendTransform(tf_msg)
-            self._log_debug(
-                f"[{state.config.name}] published tf {tf_msg.header.frame_id} -> {tf_msg.child_frame_id}"
-            )
 
     @staticmethod
     def _extract_markers_from_msg(msg: ArucoDetection) -> List[Any]:
@@ -793,7 +1257,7 @@ class SceneLocalizerNode(Node):
 
         return None
 
-    def _stamp_to_sec(self, msg: ArucoDetection) -> float:
+    def _stamp_to_sec(self, msg: Any) -> float:
         header = getattr(msg, "header", None)
         if header is not None and hasattr(header, "stamp"):
             stamp = header.stamp

@@ -49,8 +49,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        eef_camera,
-        eef_aruco,
+        #eef_camera,
+        #eef_aruco,
         top_camera,
         top_aruco,
     ])
