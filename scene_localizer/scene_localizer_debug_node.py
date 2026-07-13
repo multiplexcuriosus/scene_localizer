@@ -11,7 +11,7 @@ import rclpy
 import rclpy.time
 from aruco_opencv_msgs.msg import ArucoDetection
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
+from geometry_msgs.msg import PointStamped, Pose, PoseStamped, TransformStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from scene_localizer.msg import BallTrajectory
@@ -138,6 +138,7 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("top_detections_topic", "/aruco_top_cam/aruco_detections")
         self.declare_parameter("top_debug_image_topic", "/scene_localizer/top_cam/reprojection_debug")
         self.declare_parameter("top_trajectory_debug_image_topic", "/scene_localizer/top_cam/ball_trajectory_debug")
+        self.declare_parameter("ball_2d_px_topic", "/ball_tracker2/ball_2d_px")
 
         # Publishes/consumes T_top_camera_table:
         # pose of table_frame expressed in top_camera_frame.
@@ -177,7 +178,7 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("tf_lookup_timeout_sec", 0.05)
         self.declare_parameter("allow_base_table_fallback_from_tf", True)
 
-        self.declare_parameter("physical_marker_size", 0.035)
+        self.declare_parameter("physical_marker_size",-1.0)
         self.declare_parameter("axis_length", 0.08)
         self.declare_parameter("detection_timeout_sec", 0.3)
         self.declare_parameter("publish_debug_images", True)
@@ -203,11 +204,14 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("allow_backward_trajectory_intersection", False)
         self.declare_parameter("middle_line_intersection_max_distance", 0.02)
         self.declare_parameter("trajectory_intersection_radius_px", 7)
+        self.declare_parameter("ball_2d_overlay_timeout_sec", 0.25)
 
         self._latest_ball_trajectory: Optional[BallTrajectory] = None
         self._latest_ball_trajectory_time_sec: Optional[float] = None
         self._latest_robot_base_table_pose: Optional[PoseStamped] = None
         self._latest_robot_base_table_pose_time_sec: Optional[float] = None
+        self._latest_ball_2d_px: Optional[PointStamped] = None
+        self._latest_ball_2d_px_time_sec: Optional[float] = None
 
         self._top = self._make_top_camera_state(
             name="top_cam",
@@ -253,6 +257,12 @@ class SceneLocalizerDebugNode(Node):
             PoseStamped,
             str(self.get_parameter("robot_base_table_pose_topic").value),
             self._robot_base_table_pose_callback,
+            10,
+        )
+        self.create_subscription(
+            PointStamped,
+            str(self.get_parameter("ball_2d_px_topic").value),
+            self._ball_2d_px_callback,
             10,
         )
 
@@ -319,6 +329,10 @@ class SceneLocalizerDebugNode(Node):
     def _camera_info_callback(self, msg: CameraInfo) -> None:
         self._top.latest_camera_info = msg
 
+    def _ball_2d_px_callback(self, msg: PointStamped) -> None:
+        self._latest_ball_2d_px = msg
+        self._latest_ball_2d_px_time_sec = self._stamp_to_sec(msg)
+
     def _detections_callback(self, msg: ArucoDetection) -> None:
         self._top.latest_detections = msg
         self._top.latest_detection_time_sec = self._stamp_to_sec(msg)
@@ -348,6 +362,7 @@ class SceneLocalizerDebugNode(Node):
             else:
                 self._draw_table_rectangle_overlay(trajectory_frame, self._top.latest_camera_info)
                 self._draw_ball_trajectory_overlay(trajectory_frame, self._top.latest_camera_info)
+            self._draw_ball_2d_px_overlay(trajectory_frame, msg)
             self._publish_trajectory_debug_image(msg, trajectory_frame)
 
         if not publish_reprojection_debug:
@@ -401,6 +416,38 @@ class SceneLocalizerDebugNode(Node):
         debug_msg = self._bridge.cv2_to_imgmsg(frame, encoding="bgr8")
         debug_msg.header = src_msg.header
         self._top.trajectory_debug_pub.publish(debug_msg)
+
+    def _draw_ball_2d_px_overlay(self, frame: np.ndarray, image_msg: Image) -> None:
+        ball = self._latest_ball_2d_px
+        stamp_sec = self._latest_ball_2d_px_time_sec
+        if ball is None or stamp_sec is None:
+            return
+
+        now_sec = self.get_clock().now().nanoseconds * 1e-9
+        timeout_sec = max(0.0, float(self.get_parameter("ball_2d_overlay_timeout_sec").value))
+        if (now_sec - stamp_sec) > timeout_sec:
+            return
+
+        image_frame_id = str(getattr(image_msg.header, "frame_id", "")).strip()
+        ball_frame_id = str(getattr(ball.header, "frame_id", "")).strip()
+        if image_frame_id and ball_frame_id and image_frame_id != ball_frame_id:
+            return
+
+        u = float(ball.point.x)
+        v = float(ball.point.y)
+        radius = float(ball.point.z)
+        if not np.isfinite(u) or not np.isfinite(v):
+            return
+        if not np.isfinite(radius):
+            radius = 0.0
+
+        center = (int(round(u)), int(round(v)))
+        radius_px = max(0, int(round(radius)))
+
+        # Draw tracker center and the reported enclosing-circle circumference.
+        cv2.circle(frame, center, 4, (0, 0, 255), -1)
+        if radius_px > 0:
+            cv2.circle(frame, center, radius_px, (0, 255, 255), 2)
 
     def _begin_frame_text(self, frame: np.ndarray) -> None:
         self._text_y_by_frame_id[id(frame)] = 18

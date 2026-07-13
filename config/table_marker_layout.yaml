@@ -1,7 +1,7 @@
 # Table dimensions are in meters.
 table_shortedge: 0.6
 table_longedge: 1.2
-physical_marker_size: 0.035
+physical_marker_size: 0.0982
 marker_height: 0.0
 
 # marker_translation_origin controls how marker translations are interpreted.
@@ -12,29 +12,43 @@ streams:
   top_cam:
     markers:
       0:
-        translation: [0.07, 0.285, 0.004]
+        translation: [0.003,0.0325, 0.0]
         rpy: [0.0, 0.0, 0.0]
       1:
-        translation: [0.035, 0.58, 0.004]
+        translation: [0.497, 0.033, 0.0] 
         rpy: [0.0, 0.0, 0.0]
       2:
-        translation: [0.495, 0.355, 0.004]
+        translation: [0.498, 0.514, 0.0]
         rpy: [0.0, 0.0, 0.0]
       3:
-        translation: [0.53, 0.46, 0.004]
+        translation: [0.004, 0.395, 0.0]
         rpy: [0.0, 0.0, 0.0]
+  # top_cam:
+  #   markers:
+  #     0:
+  #       translation: [0.07, 0.285, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     1:
+  #       translation: [0.565, 0.32, 0.004] #  [0.035, 0.58, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     2:
+  #       translation: [0.495, 0.355, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     3:
+  #       translation: [0.53, 0.46, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
 
-  eef_cam:
-    markers:
-      0:
-        translation: [0.37, 1.08, 0.004]
-        rpy: [0.0, 0.0, 0.0]
-      1:
-        translation: [0.405, 1.165, 0.004]
-        rpy: [0.0, 0.0, 0.0]
-      2:
-        translation: [0.23, 1.115, 0.004]
-        rpy: [0.0, 0.0, 0.0]
-      3:
-        translation: [0.195, 1.2, 0.004]
-        rpy: [0.0, 0.0, 0.0]
+  # eef_cam:
+  #   markers:
+  #     0:
+  #       translation: [0.37, 1.08, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     1:
+  #       translation: [0.405, 1.165, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     2:
+  #       translation: [0.23, 1.115, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]
+  #     3:
+  #       translation: [0.195, 1.2, 0.004]
+  #       rpy: [0.0, 0.0, 0.0]

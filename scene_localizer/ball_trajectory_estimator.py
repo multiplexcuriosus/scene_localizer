@@ -13,6 +13,7 @@ from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped, TransformS
 from rclpy.duration import Duration
 from rclpy.node import Node
 from scene_localizer.msg import BallTrajectory
+from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -194,6 +195,11 @@ class BallTrajectoryEstimator(Node):
         )
         self._traj_pub = self.create_publisher(BallTrajectory, output_topic, 10)
         self._marker_pub = self.create_publisher(Marker, marker_topic, 10)
+        self._reset_srv = self.create_service(
+            Trigger,
+            "~/reset",
+            self._handle_reset,
+        )
 
         self.get_logger().info(
             "ball_trajectory_estimator started with params: "
@@ -212,6 +218,22 @@ class BallTrajectoryEstimator(Node):
             f"direction_stability_max_angle_deg={self.get_parameter('direction_stability_max_angle_deg').value}, "
             f"publish_invalid_trajectory={self.get_parameter('publish_invalid_trajectory').value}"
         )
+
+    def _handle_reset(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        del request
+
+        dropped_samples = len(self._buffer)
+        dropped_directions = len(self._direction_history)
+        self._buffer.clear()
+        self._direction_history.clear()
+
+        response.success = True
+        response.message = (
+            f"Cleared estimator state: samples={dropped_samples}, "
+            f"direction_history={dropped_directions}"
+        )
+        self.get_logger().info(response.message)
+        return response
 
     def _log_debug(self, message: str) -> None:
         if bool(self.get_parameter("debug_log").value):
