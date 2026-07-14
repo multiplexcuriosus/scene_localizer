@@ -120,6 +120,16 @@ class FitResult:
     intersection_along_middle_m: float = float("nan")
 
 
+@dataclass
+class IntersectionCandidate:
+    source_stamp_sec: float
+    hit_point: np.ndarray
+    hit_stamp_sec: float
+    along_middle_m: float
+    fit_rms_error: float
+    num_observations: int
+
+
 class BallTrajectoryEstimator(Node):
     def __init__(self) -> None:
         super().__init__("ball_trajectory_estimator")
@@ -127,6 +137,7 @@ class BallTrajectoryEstimator(Node):
         self._last_warn_time_ns: Dict[str, int] = {}
         self._buffer: List[BufferEntry] = []
         self._direction_history: Deque[np.ndarray] = deque()
+        self._intersection_history: Deque[IntersectionCandidate] = deque()
 
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
@@ -158,6 +169,13 @@ class BallTrajectoryEstimator(Node):
         # Conservative direction gating.
         self.declare_parameter("direction_stability_frame_count", 3)
         self.declare_parameter("direction_stability_max_angle_deg", 15.0)
+
+        # Interception refinement / convergence gating.
+        self.declare_parameter("min_commit_observations", 6)
+        self.declare_parameter("intersection_stability_count", 4)
+        self.declare_parameter("max_intersection_spread_m", 0.008)
+        self.declare_parameter("max_hit_time_spread_sec", 0.08)
+        self.declare_parameter("max_commit_fit_rms_error_m", 0.015)
 
         # Middle-line / TCP intersection checks.
         self.declare_parameter("ball_radius", 0.035)
@@ -216,6 +234,11 @@ class BallTrajectoryEstimator(Node):
             f"max_fit_rms_error_m={self.get_parameter('max_fit_rms_error_m').value}, "
             f"direction_stability_frame_count={self.get_parameter('direction_stability_frame_count').value}, "
             f"direction_stability_max_angle_deg={self.get_parameter('direction_stability_max_angle_deg').value}, "
+            f"min_commit_observations={self.get_parameter('min_commit_observations').value}, "
+            f"intersection_stability_count={self.get_parameter('intersection_stability_count').value}, "
+            f"max_intersection_spread_m={self.get_parameter('max_intersection_spread_m').value}, "
+            f"max_hit_time_spread_sec={self.get_parameter('max_hit_time_spread_sec').value}, "
+            f"max_commit_fit_rms_error_m={self.get_parameter('max_commit_fit_rms_error_m').value}, "
             f"publish_invalid_trajectory={self.get_parameter('publish_invalid_trajectory').value}"
         )
 
@@ -224,16 +247,26 @@ class BallTrajectoryEstimator(Node):
 
         dropped_samples = len(self._buffer)
         dropped_directions = len(self._direction_history)
+        dropped_intersections = len(self._intersection_history)
         self._buffer.clear()
         self._direction_history.clear()
+        self._intersection_history.clear()
 
         response.success = True
         response.message = (
             f"Cleared estimator state: samples={dropped_samples}, "
-            f"direction_history={dropped_directions}"
+            f"direction_history={dropped_directions}, "
+            f"intersection_history={dropped_intersections}"
         )
         self.get_logger().info(response.message)
         return response
+
+    def _clear_intersection_history(self) -> None:
+        self._intersection_history.clear()
+
+    def _clear_motion_histories(self) -> None:
+        self._direction_history.clear()
+        self._intersection_history.clear()
 
     def _log_debug(self, message: str) -> None:
         if bool(self.get_parameter("debug_log").value):
@@ -314,7 +347,18 @@ class BallTrajectoryEstimator(Node):
 
         fit = self.fit_trajectory(now_sec)
         if not fit.valid:
-            self._warn_throttled(f"fit_invalid_{fit.reason}", f"Trajectory invalid: {fit.reason}", 1.0)
+            provisional_reasons = {
+                "refining_observation_count",
+                "refining_intersection_history",
+                "intersection_not_converged",
+                "hit_time_not_converged",
+                "commit_rms_too_high",
+                "duplicate_intersection_estimate",
+            }
+            if fit.reason in provisional_reasons:
+                self._log_debug(f"Trajectory provisional: {fit.reason}")
+            else:
+                self._warn_throttled(f"fit_invalid_{fit.reason}", f"Trajectory invalid: {fit.reason}", 1.0)
 
         if fit.valid or bool(self.get_parameter("publish_invalid_trajectory").value):
             self.publish_trajectory(fit)
@@ -343,6 +387,10 @@ class BallTrajectoryEstimator(Node):
         velocity: np.ndarray,
         fit_rms_error: float,
         num_observations: int,
+        middle_anchor_point: Optional[np.ndarray] = None,
+        middle_direction: Optional[np.ndarray] = None,
+        intersection_along_ball_m: float = float("nan"),
+        intersection_along_middle_m: float = float("nan"),
     ) -> FitResult:
         return FitResult(
             valid=False,
@@ -354,6 +402,127 @@ class BallTrajectoryEstimator(Node):
             velocity=velocity,
             fit_rms_error=fit_rms_error,
             num_observations=num_observations,
+            middle_anchor_point=middle_anchor_point,
+            middle_direction=middle_direction,
+            intersection_along_ball_m=intersection_along_ball_m,
+            intersection_along_middle_m=intersection_along_middle_m,
+        )
+
+    def _check_intersection_convergence(
+        self,
+        *,
+        source_stamp_sec: float,
+        hit_point: np.ndarray,
+        hit_stamp_sec: float,
+        along_middle_m: float,
+        fit_rms_error: float,
+        num_observations: int,
+    ) -> Tuple[bool, str, float, float]:
+        min_commit_observations = max(
+            1,
+            int(self.get_parameter("min_commit_observations").value),
+        )
+
+        stability_count = max(
+            1,
+            int(self.get_parameter("intersection_stability_count").value),
+        )
+
+        max_intersection_spread_m = max(
+            0.0,
+            float(self.get_parameter("max_intersection_spread_m").value),
+        )
+
+        max_hit_time_spread_sec = max(
+            0.0,
+            float(self.get_parameter("max_hit_time_spread_sec").value),
+        )
+
+        max_commit_fit_rms_error_m = max(
+            0.0,
+            float(self.get_parameter("max_commit_fit_rms_error_m").value),
+        )
+
+        if (
+            self._intersection_history
+            and source_stamp_sec
+            <= self._intersection_history[-1].source_stamp_sec + 1e-9
+        ):
+            return False, "duplicate_intersection_estimate", float("inf"), float("inf")
+
+        self._intersection_history.append(
+            IntersectionCandidate(
+                source_stamp_sec=source_stamp_sec,
+                hit_point=hit_point.copy(),
+                hit_stamp_sec=hit_stamp_sec,
+                along_middle_m=along_middle_m,
+                fit_rms_error=fit_rms_error,
+                num_observations=num_observations,
+            )
+        )
+
+        while len(self._intersection_history) > stability_count:
+            self._intersection_history.popleft()
+
+        if num_observations < min_commit_observations:
+            return False, "refining_observation_count", float("inf"), float("inf")
+
+        if len(self._intersection_history) < stability_count:
+            return False, "refining_intersection_history", float("inf"), float("inf")
+
+        middle_positions = np.array(
+            [
+                candidate.along_middle_m
+                for candidate in self._intersection_history
+            ],
+            dtype=float,
+        )
+
+        intersection_spread_m = float(
+            np.max(middle_positions) - np.min(middle_positions)
+        )
+
+        if intersection_spread_m > max_intersection_spread_m:
+            return (
+                False,
+                "intersection_not_converged",
+                intersection_spread_m,
+                float("inf"),
+            )
+
+        hit_times = np.array(
+            [
+                candidate.hit_stamp_sec
+                for candidate in self._intersection_history
+            ],
+            dtype=float,
+        )
+
+        hit_time_spread_sec = float(
+            np.max(hit_times) - np.min(hit_times)
+        )
+
+        if hit_time_spread_sec > max_hit_time_spread_sec:
+            return (
+                False,
+                "hit_time_not_converged",
+                intersection_spread_m,
+                hit_time_spread_sec,
+            )
+
+        if fit_rms_error > max_commit_fit_rms_error_m:
+            return (
+                False,
+                "commit_rms_too_high",
+                intersection_spread_m,
+                hit_time_spread_sec,
+            )
+
+        return (
+            True,
+            "ok",
+            intersection_spread_m,
+            hit_time_spread_sec,
         )
 
     def fit_trajectory(self, now_sec: Optional[float] = None) -> FitResult:
@@ -365,7 +534,6 @@ class BallTrajectoryEstimator(Node):
         default_stamp = now_sec
 
         if num_observations == 0:
-            self._direction_history.clear()
             return self._invalid_result(
                 "insufficient_samples",
                 zero_vec,
@@ -432,7 +600,7 @@ class BallTrajectoryEstimator(Node):
         max_fit_rms_error_m = max(0.0, float(self.get_parameter("max_fit_rms_error_m").value))
 
         if speed < min_speed_mps:
-            self._direction_history.clear()
+            self._clear_motion_histories()
             return self._invalid_result(
                 "speed_too_low",
                 oldest_fit,
@@ -444,7 +612,7 @@ class BallTrajectoryEstimator(Node):
                 num_observations,
             )
         if speed > max_speed_mps:
-            self._direction_history.clear()
+            self._clear_motion_histories()
             return self._invalid_result(
                 "speed_too_high",
                 oldest_fit,
@@ -456,7 +624,7 @@ class BallTrajectoryEstimator(Node):
                 num_observations,
             )
         if fit_rms_error > max_fit_rms_error_m:
-            self._direction_history.clear()
+            self._clear_motion_histories()
             return self._invalid_result(
                 "high_rms",
                 oldest_fit,
@@ -475,7 +643,7 @@ class BallTrajectoryEstimator(Node):
         xy_speed = float(np.linalg.norm(xy_velocity))
         min_xy_speed_mps = max(0.0, float(self.get_parameter("min_xy_speed_mps").value))
         if xy_speed < min_xy_speed_mps:
-            self._direction_history.clear()
+            self._clear_motion_histories()
             return self._invalid_result(
                 "xy_speed_too_low",
                 current_on_ball_plane,
@@ -489,7 +657,10 @@ class BallTrajectoryEstimator(Node):
 
         ball_direction_xy = xy_velocity / xy_speed
         self._push_direction(ball_direction_xy)
-        if not self._direction_is_stable(ball_direction_xy):
+        is_direction_stable, sharp_direction_change = self._direction_is_stable(ball_direction_xy)
+        if not is_direction_stable:
+            if sharp_direction_change:
+                self._clear_intersection_history()
             return self._invalid_result(
                 "unstable_direction",
                 current_on_ball_plane,
@@ -503,6 +674,7 @@ class BallTrajectoryEstimator(Node):
 
         geometry = self._compute_middle_line_geometry(now_sec)
         if geometry is None:
+            self._clear_motion_histories()
             return self._invalid_result(
                 "middle_line_unavailable",
                 current_on_ball_plane,
@@ -522,6 +694,7 @@ class BallTrajectoryEstimator(Node):
             middle_direction=middle_direction,
         )
         if hit is None:
+            self._clear_motion_histories()
             return self._invalid_result(
                 "no_middle_line_intersection",
                 current_on_ball_plane,
@@ -539,6 +712,7 @@ class BallTrajectoryEstimator(Node):
             line_length = max(0.0, float(self.get_parameter("tcp_middle_line_length").value))
             margin = max(0.0, float(self.get_parameter("middle_line_segment_margin_m").value))
             if along_middle_m < -margin or along_middle_m > line_length + margin:
+                self._clear_motion_histories()
                 return self._invalid_result(
                     "intersection_outside_middle_segment",
                     current_on_ball_plane,
@@ -548,16 +722,69 @@ class BallTrajectoryEstimator(Node):
                     velocity,
                     fit_rms_error,
                     num_observations,
+                    middle_anchor_point=middle_anchor,
+                    middle_direction=middle_direction,
+                    intersection_along_ball_m=along_ball_m,
+                    intersection_along_middle_m=along_middle_m,
                 )
 
         hit_stamp_sec = t_newest
         if xy_speed > 1e-9:
             hit_stamp_sec = t_newest + max(0.0, along_ball_m) / xy_speed
 
+        (
+            intersection_converged,
+            convergence_reason,
+            intersection_spread_m,
+            hit_time_spread_sec,
+        ) = self._check_intersection_convergence(
+            source_stamp_sec=t_newest,
+            hit_point=hit_point,
+            hit_stamp_sec=hit_stamp_sec,
+            along_middle_m=along_middle_m,
+            fit_rms_error=fit_rms_error,
+            num_observations=num_observations,
+        )
+
+        if not intersection_converged:
+            self._log_debug(
+                "trajectory provisional: "
+                f"reason={convergence_reason}, "
+                f"observations={num_observations}, "
+                f"history={len(self._intersection_history)}, "
+                f"intersection_spread={intersection_spread_m:.6f}, "
+                f"hit_time_spread={hit_time_spread_sec:.6f}, "
+                f"rms={fit_rms_error:.6f}"
+            )
+
+            return self._invalid_result(
+                convergence_reason,
+                current_on_ball_plane,
+                hit_point,
+                t_newest,
+                hit_stamp_sec,
+                velocity,
+                fit_rms_error,
+                num_observations,
+                middle_anchor_point=middle_anchor,
+                middle_direction=middle_direction,
+                intersection_along_ball_m=along_ball_m,
+                intersection_along_middle_m=along_middle_m,
+            )
+
         self._log_debug(
-            f"fit ok: speed={speed:.3f} xy_speed={xy_speed:.3f} rms={fit_rms_error:.4f}, "
-            f"hit=({hit_point[0]:.3f},{hit_point[1]:.3f},{hit_point[2]:.3f}), "
-            f"s_ball={along_ball_m:.3f}, s_middle={along_middle_m:.3f}"
+            f"fit committed: observations={num_observations}, "
+            f"history={len(self._intersection_history)}, "
+            f"speed={speed:.3f}, "
+            f"xy_speed={xy_speed:.3f}, "
+            f"rms={fit_rms_error:.4f}, "
+            f"intersection_spread={intersection_spread_m:.4f}, "
+            f"hit_time_spread={hit_time_spread_sec:.4f}, "
+            f"hit=({hit_point[0]:.3f},"
+            f"{hit_point[1]:.3f},"
+            f"{hit_point[2]:.3f}), "
+            f"s_ball={along_ball_m:.3f}, "
+            f"s_middle={along_middle_m:.3f}"
         )
 
         return FitResult(
@@ -584,18 +811,18 @@ class BallTrajectoryEstimator(Node):
         while len(self._direction_history) > stability_count:
             self._direction_history.popleft()
 
-    def _direction_is_stable(self, current_direction: np.ndarray) -> bool:
+    def _direction_is_stable(self, current_direction: np.ndarray) -> Tuple[bool, bool]:
         stability_count = max(1, int(self.get_parameter("direction_stability_frame_count").value))
         if len(self._direction_history) < stability_count:
-            return False
+            return False, False
 
         max_angle_deg = max(0.0, float(self.get_parameter("direction_stability_max_angle_deg").value))
         min_dot = float(np.cos(np.deg2rad(max_angle_deg)))
         for direction in self._direction_history:
             dot = float(np.dot(current_direction, direction))
             if not np.isfinite(dot) or dot < min_dot:
-                return False
-        return True
+                return False, True
+        return True, False
 
     def _compute_middle_line_geometry(self, now_sec: float) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         transforms = self._compute_table_tcp_and_base_table(now_sec)
@@ -618,6 +845,7 @@ class BallTrajectoryEstimator(Node):
         norm = float(np.linalg.norm(middle_direction))
         if norm < 1e-9:
             self._warn_throttled("base_x_degenerate", "robot-base +x projected to table xy is degenerate", 1.0)
+            self._clear_motion_histories()
             return None
         middle_direction /= norm
 
@@ -636,21 +864,25 @@ class BallTrajectoryEstimator(Node):
             or not _is_finite_vector(middle_anchor)
             or not _is_finite_vector(middle_direction)
         ):
+            self._clear_motion_histories()
             return None
 
         z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
         plane_normal = np.cross(middle_direction, z_axis)
         normal_norm = float(np.linalg.norm(plane_normal))
         if normal_norm < 1e-9:
+            self._clear_motion_histories()
             return None
         plane_normal /= normal_norm
 
         denom = float(np.dot(plane_normal, ball_direction_xy))
         if abs(denom) < 1e-9:
+            self._clear_motion_histories()
             return None
 
         along_ball_m = float(np.dot(plane_normal, middle_anchor - current_on_ball_plane) / denom)
         if along_ball_m < 0.0 and not bool(self.get_parameter("allow_backward_intersection").value):
+            self._clear_motion_histories()
             return None
 
         hit_point = current_on_ball_plane + along_ball_m * ball_direction_xy

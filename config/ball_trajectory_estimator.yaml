@@ -9,6 +9,16 @@ ball_trajectory_estimator:
     min_observations: 3
     max_buffer_size: 10
     buffer_time_window_sec: 0.5
+
+    direction_stability_frame_count: 3
+    direction_stability_max_angle_deg: 15.0
+
+    min_commit_observations: 6
+    intersection_stability_count: 4
+    max_intersection_spread_m: 0.008
+    max_hit_time_spread_sec: 0.08
+    max_commit_fit_rms_error_m: 0.015
+
     min_time_span_sec: 0.05
     max_detection_age_sec: 0.25
 
