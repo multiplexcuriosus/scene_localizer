@@ -2,10 +2,12 @@ scene_localizer_debug:
   ros__parameters:
     ball_trajectory_topic: "/scene/ball_trajectory_table"
 
-    top_trajectory_debug_image_topic: "/scene_localizer_debug/top_cam/ball_trajectory_debug"
-    eef_trajectory_debug_image_topic: "/scene_localizer_debug/eef_cam/ball_trajectory_debug"
+    top_debug_image_topic: "/scene_localizer_debug/top_cam/debug_image"
 
-    publish_trajectory_debug_images: true
+    publish_debug_images: true
+    debug_render_rate_hz: 30.0
+    log_render_timing: false
+    tf_lookup_timeout_sec: 0.0
     trajectory_timeout_sec: 0.5
     draw_trajectory_debug_text: true
 

@@ -295,11 +295,11 @@ class SceneLocalizerNode(Node):
 
         # Optional: require at least this many different markers rather than all.
         # Set to 0 to require all required_marker_ids/layout markers.
-        self.declare_parameter("min_required_markers", 0)
+        self.declare_parameter("min_required_markers", 3)
 
         self.declare_parameter("max_observations_per_marker", 100)
 
-        self.declare_parameter("publish_rate_hz", 10.0)
+        self.declare_parameter("publish_rate_hz", 30.0)
         self.declare_parameter("estimation_mode", "marker_center_alignment")
         self.declare_parameter("top_estimation_mode", "")
         self.declare_parameter("max_candidate_translation_deviation", 0.05)

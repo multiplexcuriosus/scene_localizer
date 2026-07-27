@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -14,6 +16,8 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, Pose, PoseStamped, TransformStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from fr3_husky_msgs.msg import MiddleLine
 from scene_localizer.msg import BallTrajectory
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -110,10 +114,6 @@ class TopCameraState:
     camera_info_topic: str
     detections_topic: str
     table_pose_topic: str
-    debug_image_topic: str
-    trajectory_debug_image_topic: str
-    debug_pub: Any
-    trajectory_debug_pub: Any
     latest_camera_info: Optional[CameraInfo] = None
     latest_detections: Optional[ArucoDetection] = None
     latest_detection_time_sec: Optional[float] = None
@@ -128,16 +128,29 @@ class SceneLocalizerDebugNode(Node):
         self._bridge = CvBridge()
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
-        self._text_y_by_frame_id: Dict[int, int] = {}
         self._last_warn_time_ns: Dict[str, int] = {}
+        self._last_debug_time_ns: Dict[str, int] = {}
+        self._text_y = 18
+        self._perf_last_report_monotonic = time.monotonic()
+        self._perf_window_count = 0
+        self._perf_window_sums_ms: Dict[str, float] = {}
+        self._perf_window_max_ms: Dict[str, float] = {}
 
-        # Top camera only. The eef-camera stream and old T_table_eef_cam /
-        # T_tcp_end_cam logic were intentionally removed.
+        self._latest_image_lock = threading.Lock()
+        self._latest_image_msg: Optional[Image] = None
+        self._latest_image_stamp_ns: Optional[int] = None
+        self._last_rendered_image_stamp_ns: Optional[int] = None
+
+        self._camera_K_native: Optional[np.ndarray] = None
+        self._camera_D: Optional[np.ndarray] = None
+        self._camera_projection_is_rectified = False
+        self._zero_rvec = np.zeros((3, 1), dtype=np.float64)
+        self._zero_tvec = np.zeros((3, 1), dtype=np.float64)
+
         self.declare_parameter("top_image_topic", "/top_cam/camera/color/image_raw")
         self.declare_parameter("top_camera_info_topic", "/top_cam/camera/color/camera_info")
         self.declare_parameter("top_detections_topic", "/aruco_top_cam/aruco_detections")
-        self.declare_parameter("top_debug_image_topic", "/scene_localizer/top_cam/reprojection_debug")
-        self.declare_parameter("top_trajectory_debug_image_topic", "/scene_localizer/top_cam/ball_trajectory_debug")
+        self.declare_parameter("top_debug_image_topic", "/scene_localizer_debug/top_cam/debug_image")
         self.declare_parameter("ball_2d_px_topic", "/ball_tracker2/ball_2d_px")
 
         # Publishes/consumes T_top_camera_table:
@@ -151,50 +164,49 @@ class SceneLocalizerDebugNode(Node):
         # pose of table_frame expressed in robot_base_frame.
         self.declare_parameter("robot_base_table_pose_topic", "/scene_localizer/table_pose_robot_base")
 
-        # Current frame knowledge from your calibration YAML:
-        # /tmp/T_base_cam.yaml currently uses parent_frame: base and
-        # child_frame: camera_color_optical_frame. Keep these defaults aligned.
-
-        # robot_base_frame:
-        # Parent frame for robot/world-side overlays.
-        # With current YAML, T_robot_base_top_camera = T_base_camera_color_optical_frame.
         self.declare_parameter("robot_base_frame", "base")
-
-        # top_camera_frame:
-        # Optical camera frame used by image projection and ArUco detections.
-        # T_top_camera_table maps table-frame points into this camera frame.
         self.declare_parameter("top_camera_frame", "camera_color_optical_frame")
-
-        # table_frame:
-        # Logical table coordinate system used by marker layout and ball trajectory.
-        # T_robot_base_table maps table-frame points into robot_base_frame.
         self.declare_parameter("table_frame", "table_frame")
-
-        # tcp_frame:
-        # Robot TCP/interceptor frame looked up from TF as T_robot_base_tcp.
-        # Middle-line drawing computes T_table_tcp = inverse(T_robot_base_table) * T_robot_base_tcp.
         self.declare_parameter("tcp_frame", "right_fr3_hand_tcp")
 
-        self.declare_parameter("tf_lookup_timeout_sec", 0.05)
+        # For real-time debug rendering, keep TF lookup non-blocking by default.
+        self.declare_parameter("tf_lookup_timeout_sec", 0.0)
         self.declare_parameter("allow_base_table_fallback_from_tf", True)
 
-        self.declare_parameter("physical_marker_size",-1.0)
+        self.declare_parameter("physical_marker_size", -1.0)
         self.declare_parameter("axis_length", 0.08)
         self.declare_parameter("detection_timeout_sec", 0.3)
         self.declare_parameter("publish_debug_images", True)
-        self.declare_parameter("publish_trajectory_debug_images", True)
+        self.declare_parameter("debug_render_rate_hz", 30.0)
+        self.declare_parameter("log_render_timing", False)
+        self.declare_parameter("draw_debug_text", False)
+
         self.declare_parameter("table_shortedge", 0.6)
         self.declare_parameter("table_longedge", 1.2)
         self.declare_parameter("table_edge_z", 0.0)
         self.declare_parameter("table_pose_timeout_sec", 1.0)
         self.declare_parameter("robot_base_table_pose_timeout_sec", 1.0)
         self.declare_parameter("draw_table_rectangle", True)
+
         self.declare_parameter("trajectory_timeout_sec", 0.5)
         self.declare_parameter("draw_trajectory_debug_text", True)
         self.declare_parameter("trajectory_line_thickness", 3)
         self.declare_parameter("trajectory_start_radius_px", 5)
         self.declare_parameter("trajectory_end_radius_px", 7)
+
+        # Authoritative captured middle-line state published by
+        # trajectory_executor (white-eth). Transient-local so a debug node
+        # started after capture still receives the latest state immediately.
+        self.declare_parameter(
+            "middle_line_state_topic",
+            "/trajectory_executor/middle_line_state",
+        )
+
         self.declare_parameter("draw_tcp_middle_line", True)
+        # Obsolete for the captured middle-line overlay: geometry now comes
+        # entirely from the cached MiddleLine message (center/direction/
+        # half_length). Retained only for launch-file compatibility; not read
+        # by _draw_captured_middle_line_overlay().
         self.declare_parameter("ball_radius", 0.0325)
         self.declare_parameter("tcp_middle_line_length", 0.3)
         self.declare_parameter("tcp_middle_line_half_length", 0.3)
@@ -213,14 +225,31 @@ class SceneLocalizerDebugNode(Node):
         self._latest_ball_2d_px: Optional[PointStamped] = None
         self._latest_ball_2d_px_time_sec: Optional[float] = None
 
-        self._top = self._make_top_camera_state(
+        # Authoritative captured middle-line state (persistent scene state).
+        # No freshness timeout is applied: once a valid state is received it
+        # remains displayed until a newer valid state replaces it.
+        self._latest_middle_line: Optional[MiddleLine] = None
+        self._latest_middle_line_revision: Optional[int] = None
+
+        self._top = TopCameraState(
             name="top_cam",
             image_topic=str(self.get_parameter("top_image_topic").value),
             camera_info_topic=str(self.get_parameter("top_camera_info_topic").value),
             detections_topic=str(self.get_parameter("top_detections_topic").value),
             table_pose_topic=str(self.get_parameter("top_table_pose_topic").value),
-            debug_image_topic=str(self.get_parameter("top_debug_image_topic").value),
-            trajectory_debug_image_topic=str(self.get_parameter("top_trajectory_debug_image_topic").value),
+        )
+
+        image_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        self._debug_pub = self.create_publisher(
+            Image,
+            str(self.get_parameter("top_debug_image_topic").value),
+            image_qos,
         )
 
         self.create_subscription(
@@ -245,7 +274,7 @@ class SceneLocalizerDebugNode(Node):
             Image,
             self._top.image_topic,
             self._image_callback,
-            10,
+            image_qos,
         )
         self.create_subscription(
             BallTrajectory,
@@ -266,14 +295,33 @@ class SceneLocalizerDebugNode(Node):
             10,
         )
 
+        # The captured middle-line state is published reliable/transient-local
+        # by trajectory_executor so a late-joining debug node still receives
+        # the most recent sample. Do not reuse image_qos (best-effort/volatile)
+        # for this state topic.
+        middle_line_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            MiddleLine,
+            str(self.get_parameter("middle_line_state_topic").value),
+            self._middle_line_state_callback,
+            middle_line_qos,
+        )
+
+        render_rate_hz = max(0.1, float(self.get_parameter("debug_render_rate_hz").value))
+        self._debug_render_timer = self.create_timer(1.0 / render_rate_hz, self._render_latest_debug_image)
+
         self.get_logger().info("scene_localizer_debug started in top-cam-only mode")
         self.get_logger().info(
             f"[top_cam] image={self._top.image_topic}, "
             f"camera_info={self._top.camera_info_topic}, "
             f"detections={self._top.detections_topic}, "
             f"table_pose={self._top.table_pose_topic}, "
-            f"debug_pub={self._top.debug_image_topic}, "
-            f"trajectory_debug_pub={self._top.trajectory_debug_image_topic}"
+            f"debug_pub={str(self.get_parameter('top_debug_image_topic').value)}"
         )
         self.get_logger().info(
             "Frame params: "
@@ -283,32 +331,11 @@ class SceneLocalizerDebugNode(Node):
             f"tcp_frame={str(self.get_parameter('tcp_frame').value)}"
         )
         self.get_logger().info(
-            "Middle-line overlay now computes T_table_tcp = inv(T_base_table) * T_base_tcp. "
-            "T_base_table comes from robot_base_table_pose_topic or, if enabled, from TF base->camera plus T_camera_table."
-        )
-
-    def _make_top_camera_state(
-        self,
-        name: str,
-        image_topic: str,
-        camera_info_topic: str,
-        detections_topic: str,
-        table_pose_topic: str,
-        debug_image_topic: str,
-        trajectory_debug_image_topic: str,
-    ) -> TopCameraState:
-        debug_pub = self.create_publisher(Image, debug_image_topic, 10)
-        trajectory_debug_pub = self.create_publisher(Image, trajectory_debug_image_topic, 10)
-        return TopCameraState(
-            name=name,
-            image_topic=image_topic,
-            camera_info_topic=camera_info_topic,
-            detections_topic=detections_topic,
-            table_pose_topic=table_pose_topic,
-            debug_image_topic=debug_image_topic,
-            trajectory_debug_image_topic=trajectory_debug_image_topic,
-            debug_pub=debug_pub,
-            trajectory_debug_pub=trajectory_debug_pub,
+            "Middle-line overlay source:\n"
+            f"  topic={str(self.get_parameter('middle_line_state_topic').value)}\n"
+            "  QoS=reliable/transient_local\n"
+            "  geometry=center + direction + half_length\n"
+            "  live TCP following disabled"
         )
 
     def _warn_throttled(self, key: str, message: str, throttle_sec: float = 1.0) -> None:
@@ -317,6 +344,13 @@ class SceneLocalizerDebugNode(Node):
         if now_ns - last_ns >= int(throttle_sec * 1e9):
             self._last_warn_time_ns[key] = now_ns
             self.get_logger().warn(message)
+
+    def _debug_throttled(self, key: str, message: str, throttle_sec: float = 1.0) -> None:
+        now_ns = self.get_clock().now().nanoseconds
+        last_ns = self._last_debug_time_ns.get(key, 0)
+        if now_ns - last_ns >= int(throttle_sec * 1e9):
+            self._last_debug_time_ns[key] = now_ns
+            self.get_logger().debug(message)
 
     def _ball_trajectory_callback(self, msg: BallTrajectory) -> None:
         self._latest_ball_trajectory = msg
@@ -329,9 +363,125 @@ class SceneLocalizerDebugNode(Node):
     def _camera_info_callback(self, msg: CameraInfo) -> None:
         self._top.latest_camera_info = msg
 
+        if len(msg.k) < 9:
+            self._camera_K_native = None
+            self._camera_D = None
+            self._camera_projection_is_rectified = False
+            return
+
+        K = np.asarray(msg.k, dtype=np.float64).reshape(3, 3)
+        if not np.all(np.isfinite(K)):
+            self._camera_K_native = None
+            self._camera_D = None
+            self._camera_projection_is_rectified = False
+            return
+
+        D = np.asarray(msg.d, dtype=np.float64).reshape(-1, 1)
+        is_rectified = D.size == 0 or np.all(np.abs(D) < 1e-9)
+
+        self._camera_K_native = K
+        self._camera_D = D
+        self._camera_projection_is_rectified = bool(is_rectified)
+
     def _ball_2d_px_callback(self, msg: PointStamped) -> None:
         self._latest_ball_2d_px = msg
         self._latest_ball_2d_px_time_sec = self._stamp_to_sec(msg)
+
+    def _middle_line_state_callback(self, msg: MiddleLine) -> None:
+        """Cache the latest valid captured middle-line state.
+
+        No freshness timeout is applied here: the cached state remains the
+        authoritative pink-line geometry until a newer valid message with a
+        higher (or equal) revision replaces it. An invalid message never
+        clears a previously cached valid state.
+        """
+        if not bool(msg.valid):
+            self._debug_throttled(
+                "middle_line_invalid_msg",
+                "Ignoring middle-line state: valid=False",
+                2.0,
+            )
+            return
+
+        center = np.array(
+            [float(msg.center.x), float(msg.center.y), float(msg.center.z)],
+            dtype=float,
+        )
+        if not _is_finite_vector(center):
+            self._warn_throttled(
+                "middle_line_center_non_finite",
+                "Ignoring middle-line state: center contains non-finite values",
+                2.0,
+            )
+            return
+
+        direction = np.array(
+            [float(msg.direction.x), float(msg.direction.y), float(msg.direction.z)],
+            dtype=float,
+        )
+        if not _is_finite_vector(direction):
+            self._warn_throttled(
+                "middle_line_direction_non_finite",
+                "Ignoring middle-line state: direction contains non-finite values",
+                2.0,
+            )
+            return
+
+        direction_norm = float(np.linalg.norm(direction))
+        if direction_norm <= 1e-9:
+            self._warn_throttled(
+                "middle_line_direction_degenerate",
+                "Ignoring middle-line state: direction norm is too small",
+                2.0,
+            )
+            return
+
+        half_length = float(msg.half_length)
+        if not np.isfinite(half_length) or half_length <= 0.0:
+            self._warn_throttled(
+                "middle_line_half_length_invalid",
+                f"Ignoring middle-line state: half_length={half_length} is not finite/positive",
+                2.0,
+            )
+            return
+
+        incoming_revision = int(msg.revision)
+
+        if (
+            self._latest_middle_line_revision is not None
+            and incoming_revision < self._latest_middle_line_revision
+        ):
+            self._warn_throttled(
+                "middle_line_old_revision",
+                (
+                    f"Ignoring older middle-line revision {incoming_revision}; "
+                    f"current revision is {self._latest_middle_line_revision}"
+                ),
+                2.0,
+            )
+            return
+
+        if (
+            self._latest_middle_line_revision is not None
+            and incoming_revision == self._latest_middle_line_revision
+        ):
+            # Same revision re-delivered (e.g. transient-local replay on a
+            # fresh subscription match): refresh the cached message without
+            # repeatedly logging it.
+            self._latest_middle_line = msg
+            return
+
+        self._latest_middle_line = msg
+        self._latest_middle_line_revision = incoming_revision
+
+        self.get_logger().info(
+            f"Updated captured middle line: revision={incoming_revision}, "
+            f"frame={msg.header.frame_id}, "
+            f"center=({msg.center.x:.4f}, {msg.center.y:.4f}, {msg.center.z:.4f}), "
+            f"direction=({msg.direction.x:.4f}, {msg.direction.y:.4f}, {msg.direction.z:.4f}), "
+            f"half_length={msg.half_length:.4f}, "
+            f"ee={msg.ee_name}"
+        )
 
     def _detections_callback(self, msg: ArucoDetection) -> None:
         self._top.latest_detections = msg
@@ -342,82 +492,268 @@ class SceneLocalizerDebugNode(Node):
         self._top.latest_table_pose_time_sec = self._stamp_to_sec(msg)
 
     def _image_callback(self, msg: Image) -> None:
-        publish_reprojection_debug = bool(self.get_parameter("publish_debug_images").value)
-        publish_trajectory_debug = bool(self.get_parameter("publish_trajectory_debug_images").value)
-        if not publish_reprojection_debug and not publish_trajectory_debug:
+        with self._latest_image_lock:
+            self._latest_image_msg = msg
+            self._latest_image_stamp_ns = self._msg_stamp_ns(msg)
+
+    def _msg_stamp_ns(self, msg: Any) -> int:
+        header = getattr(msg, "header", None)
+        if header is not None and hasattr(header, "stamp"):
+            stamp = header.stamp
+            sec = int(getattr(stamp, "sec", 0))
+            nanosec = int(getattr(stamp, "nanosec", 0))
+            total_ns = sec * 1000000000 + nanosec
+            if total_ns > 0:
+                return total_ns
+        return int(self.get_clock().now().nanoseconds)
+
+    def _stamp_age_sec(self, msg: Any, now_sec: float) -> float:
+        stamp_ns = self._msg_stamp_ns(msg)
+        return max(0.0, now_sec - (float(stamp_ns) * 1e-9))
+
+    def _perf_record_step_ms(self, step: str, elapsed_ms: float) -> None:
+        self._perf_window_sums_ms[step] = self._perf_window_sums_ms.get(step, 0.0) + elapsed_ms
+        prev_max = self._perf_window_max_ms.get(step, 0.0)
+        if elapsed_ms > prev_max:
+            self._perf_window_max_ms[step] = elapsed_ms
+
+    def _perf_maybe_report(self) -> None:
+        now_mono = time.monotonic()
+        if (now_mono - self._perf_last_report_monotonic) < 1.0:
             return
 
+        count = self._perf_window_count
+        if count <= 0:
+            self._perf_last_report_monotonic = now_mono
+            return
+
+        # Report a fixed order so timing lines are stable across reports.
+        ordered_steps = [
+            "convert",
+            "prepare_vga",
+            "intrinsics",
+            "proj_text",
+            "transforms",
+            "detection",
+            "table",
+            "ball_2d",
+            "trajectory",
+            "publish",
+            "total",
+        ]
+        parts: List[str] = []
+        for step in ordered_steps:
+            if step not in self._perf_window_sums_ms:
+                continue
+            avg_ms = self._perf_window_sums_ms[step] / float(count)
+            max_ms = self._perf_window_max_ms.get(step, 0.0)
+            parts.append(f"{step}:avg={avg_ms:.2f}ms,max={max_ms:.2f}ms")
+
+        self.get_logger().info(
+            f"debug_render_timers frames={count} over~{now_mono - self._perf_last_report_monotonic:.2f}s | "
+            + " | ".join(parts)
+        )
+
+        self._perf_last_report_monotonic = now_mono
+        self._perf_window_count = 0
+        self._perf_window_sums_ms.clear()
+        self._perf_window_max_ms.clear()
+
+    def _render_latest_debug_image(self) -> None:
+        if not bool(self.get_parameter("publish_debug_images").value):
+            return
+
+        if self._debug_pub.get_subscription_count() == 0:
+            return
+
+        with self._latest_image_lock:
+            image_msg = self._latest_image_msg
+            image_stamp_ns = self._latest_image_stamp_ns
+
+        if image_msg is None or image_stamp_ns is None:
+            return
+
+        if self._last_rendered_image_stamp_ns == image_stamp_ns:
+            return
+
+        t_fn_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame_native = self._bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
         except Exception as exc:
-            self.get_logger().warn(f"[top_cam] failed to convert image to bgr8: {exc}")
+            self._warn_throttled("image_convert_failed", f"[top_cam] failed to convert image to bgr8: {exc}", 1.0)
+            return
+        self._perf_record_step_ms("convert", (time.perf_counter() - t0) * 1000.0)
+
+        if frame_native is None or frame_native.ndim != 3:
             return
 
-        if publish_trajectory_debug:
-            trajectory_frame = frame.copy()
-            self._begin_frame_text(trajectory_frame)
-            self._draw_projection_debug_text(trajectory_frame, msg)
-            if self._top.latest_camera_info is None:
-                self._draw_status_text(trajectory_frame, "no camera_info", (0, 140, 255))
-            else:
-                self._draw_table_rectangle_overlay(trajectory_frame, self._top.latest_camera_info)
-                self._draw_ball_trajectory_overlay(trajectory_frame, self._top.latest_camera_info)
-            self._draw_ball_2d_px_overlay(trajectory_frame, msg)
-            self._publish_trajectory_debug_image(msg, trajectory_frame)
+        source_height, source_width = frame_native.shape[:2]
+        t0 = time.perf_counter()
+        frame_vga, scale, pad_x, pad_y = self._prepare_vga_frame(frame_native)
+        self._perf_record_step_ms("prepare_vga", (time.perf_counter() - t0) * 1000.0)
 
-        if not publish_reprojection_debug:
-            return
-
-        self._begin_frame_text(frame)
-        self._draw_projection_debug_text(frame, msg)
-
-        if self._top.latest_camera_info is None:
-            self._draw_status_text(frame, "no camera_info", (0, 140, 255))
-            self._publish_debug_image(msg, frame)
-            return
+        K_vga = None
+        t0 = time.perf_counter()
+        if self._camera_K_native is not None:
+            K_vga = self._camera_K_native.copy()
+            K_vga[0, 0] *= scale
+            K_vga[1, 1] *= scale
+            K_vga[0, 2] = self._camera_K_native[0, 2] * scale + pad_x
+            K_vga[1, 2] = self._camera_K_native[1, 2] * scale + pad_y
+        self._perf_record_step_ms("intrinsics", (time.perf_counter() - t0) * 1000.0)
 
         now_sec = self.get_clock().now().nanoseconds * 1e-9
-        timeout_sec = max(0.0, float(self.get_parameter("detection_timeout_sec").value))
-        stale = (
-            self._top.latest_detection_time_sec is None
-            or (now_sec - self._top.latest_detection_time_sec) > timeout_sec
+        self._begin_frame_text()
+        t0 = time.perf_counter()
+        self._draw_projection_debug_text(
+            frame=frame_vga,
+            image_msg=image_msg,
+            source_width=source_width,
+            source_height=source_height,
+            scale=scale,
+            pad_x=pad_x,
+            pad_y=pad_y,
         )
+        self._perf_record_step_ms("proj_text", (time.perf_counter() - t0) * 1000.0)
 
-        if stale:
-            self._draw_status_text(frame, "detections stale", (0, 140, 255))
-            self._draw_table_rectangle_overlay(frame, self._top.latest_camera_info)
-            self._publish_debug_image(msg, frame)
-            return
+        t0 = time.perf_counter()
+        transforms = self._get_frame_transforms(now_sec)
+        self._perf_record_step_ms("transforms", (time.perf_counter() - t0) * 1000.0)
 
-        if self._top.latest_detections is None:
-            self._draw_status_text(frame, "no detections", (0, 140, 255))
-            self._draw_table_rectangle_overlay(frame, self._top.latest_camera_info)
-            self._publish_debug_image(msg, frame)
-            return
+        if K_vga is None:
+            self._draw_status_text(frame_vga, "no valid camera_info/K", (0, 140, 255))
+        else:
+            detection_timeout_sec = max(0.0, float(self.get_parameter("detection_timeout_sec").value))
+            detections_stale = (
+                self._top.latest_detection_time_sec is None
+                or (now_sec - self._top.latest_detection_time_sec) > detection_timeout_sec
+            )
 
-        physical_marker_size = max(1e-6, float(self.get_parameter("physical_marker_size").value))
-        axis_length = max(1e-6, float(self.get_parameter("axis_length").value))
-        self._draw_detection_overlay(
-            frame=frame,
-            camera_info=self._top.latest_camera_info,
-            detections_msg=self._top.latest_detections,
-            physical_marker_size=physical_marker_size,
-            axis_length=axis_length,
-        )
-        self._draw_table_rectangle_overlay(frame, self._top.latest_camera_info)
-        self._publish_debug_image(msg, frame)
+            t0 = time.perf_counter()
+            if detections_stale:
+                self._draw_status_text(frame_vga, "detections stale", (0, 140, 255))
+            elif self._top.latest_detections is None:
+                self._draw_status_text(frame_vga, "no detections", (0, 140, 255))
+            else:
+                physical_marker_size = max(1e-6, float(self.get_parameter("physical_marker_size").value))
+                axis_length = max(1e-6, float(self.get_parameter("axis_length").value))
+                self._draw_detection_overlay(
+                    frame=frame_vga,
+                    detections_msg=self._top.latest_detections,
+                    physical_marker_size=physical_marker_size,
+                    axis_length=axis_length,
+                    K=K_vga,
+                    D=self._camera_D,
+                    image_width=640,
+                    image_height=480,
+                )
+            self._perf_record_step_ms("detection", (time.perf_counter() - t0) * 1000.0)
+
+            t0 = time.perf_counter()
+            self._draw_table_rectangle_overlay(
+                frame=frame_vga,
+                T_cam_table=transforms.get("T_cam_table"),
+                K=K_vga,
+                D=self._camera_D,
+                image_width=640,
+                image_height=480,
+            )
+            self._perf_record_step_ms("table", (time.perf_counter() - t0) * 1000.0)
+
+            t0 = time.perf_counter()
+            self._draw_ball_2d_px_overlay(
+                frame=frame_vga,
+                image_msg=image_msg,
+                scale=scale,
+                pad_x=pad_x,
+                pad_y=pad_y,
+            )
+            self._perf_record_step_ms("ball_2d", (time.perf_counter() - t0) * 1000.0)
+
+            if bool(self.get_parameter("draw_tcp_middle_line").value):
+                t0 = time.perf_counter()
+                self._draw_captured_middle_line_overlay(
+                    frame=frame_vga,
+                    K=K_vga,
+                    D=self._camera_D,
+                    image_width=640,
+                    image_height=480,
+                )
+                self._perf_record_step_ms("middle_line", (time.perf_counter() - t0) * 1000.0)
+
+            t0 = time.perf_counter()
+            self._draw_ball_trajectory_overlay(
+                frame=frame_vga,
+                now_sec=now_sec,
+                T_cam_table=transforms.get("T_cam_table"),
+                K=K_vga,
+                D=self._camera_D,
+                image_width=640,
+                image_height=480,
+            )
+            self._perf_record_step_ms("trajectory", (time.perf_counter() - t0) * 1000.0)
+
+        t0 = time.perf_counter()
+        self._publish_debug_image(image_msg, frame_vga)
+        self._perf_record_step_ms("publish", (time.perf_counter() - t0) * 1000.0)
+        self._last_rendered_image_stamp_ns = image_stamp_ns
+
+        total_ms = (time.perf_counter() - t_fn_start) * 1000.0
+        self._perf_record_step_ms("total", total_ms)
+        self._perf_window_count += 1
+        self._perf_maybe_report()
+
+        if bool(self.get_parameter("log_render_timing").value):
+            render_ms = total_ms
+            source_age_sec = self._stamp_age_sec(image_msg, now_sec)
+            self._debug_throttled(
+                "render_timing",
+                f"debug render: {render_ms:.2f} ms, source age: {source_age_sec:.3f} s",
+                1.0,
+            )
+
+    def _prepare_vga_frame(self, frame_native: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
+        source_h, source_w = frame_native.shape[:2]
+        scale = min(640.0 / float(source_w), 480.0 / float(source_h))
+        resized_w = max(1, int(round(float(source_w) * scale)))
+        resized_h = max(1, int(round(float(source_h) * scale)))
+
+        resized = cv2.resize(frame_native, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+        frame_vga = np.zeros((480, 640, 3), dtype=np.uint8)
+        pad_x = (640 - resized_w) // 2
+        pad_y = (480 - resized_h) // 2
+        frame_vga[pad_y : pad_y + resized_h, pad_x : pad_x + resized_w] = resized
+
+        return frame_vga, scale, pad_x, pad_y
+
+    def _get_frame_transforms(self, now_sec: float) -> Dict[str, Optional[np.ndarray]]:
+        T_cam_table = self._get_camera_from_table_transform(now_sec)
+        T_base_table: Optional[np.ndarray] = None
+
+        if T_cam_table is not None:
+            T_base_table = self._get_robot_base_from_table_transform(now_sec, T_cam_table)
+
+        return {
+            "T_cam_table": T_cam_table,
+            "T_base_table": T_base_table,
+        }
 
     def _publish_debug_image(self, src_msg: Image, frame: np.ndarray) -> None:
         debug_msg = self._bridge.cv2_to_imgmsg(frame, encoding="bgr8")
         debug_msg.header = src_msg.header
-        self._top.debug_pub.publish(debug_msg)
+        self._debug_pub.publish(debug_msg)
 
-    def _publish_trajectory_debug_image(self, src_msg: Image, frame: np.ndarray) -> None:
-        debug_msg = self._bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-        debug_msg.header = src_msg.header
-        self._top.trajectory_debug_pub.publish(debug_msg)
-
-    def _draw_ball_2d_px_overlay(self, frame: np.ndarray, image_msg: Image) -> None:
+    def _draw_ball_2d_px_overlay(
+        self,
+        frame: np.ndarray,
+        image_msg: Image,
+        scale: float,
+        pad_x: int,
+        pad_y: int,
+    ) -> None:
         ball = self._latest_ball_2d_px
         stamp_sec = self._latest_ball_2d_px_time_sec
         if ball is None or stamp_sec is None:
@@ -433,24 +769,27 @@ class SceneLocalizerDebugNode(Node):
         if image_frame_id and ball_frame_id and image_frame_id != ball_frame_id:
             return
 
-        u = float(ball.point.x)
-        v = float(ball.point.y)
-        radius = float(ball.point.z)
-        if not np.isfinite(u) or not np.isfinite(v):
+        u_native = float(ball.point.x)
+        v_native = float(ball.point.y)
+        radius_native = float(ball.point.z)
+        if not np.isfinite(u_native) or not np.isfinite(v_native):
             return
-        if not np.isfinite(radius):
-            radius = 0.0
+        if not np.isfinite(radius_native):
+            radius_native = 0.0
 
-        center = (int(round(u)), int(round(v)))
-        radius_px = max(0, int(round(radius)))
+        u_vga = (scale * u_native) + float(pad_x)
+        v_vga = (scale * v_native) + float(pad_y)
+        radius_vga = max(0.0, scale * radius_native)
 
-        # Draw tracker center and the reported enclosing-circle circumference.
+        center = (int(round(u_vga)), int(round(v_vga)))
+        radius_px = max(0, int(round(radius_vga)))
+
         cv2.circle(frame, center, 4, (0, 0, 255), -1)
         if radius_px > 0:
             cv2.circle(frame, center, radius_px, (0, 255, 255), 2)
 
-    def _begin_frame_text(self, frame: np.ndarray) -> None:
-        self._text_y_by_frame_id[id(frame)] = 18
+    def _begin_frame_text(self) -> None:
+        self._text_y = 18
 
     def _draw_status_text(
         self,
@@ -460,22 +799,52 @@ class SceneLocalizerDebugNode(Node):
         scale: float = 0.48,
         thickness: int = 1,
     ) -> None:
-        key = id(frame)
-        y = self._text_y_by_frame_id.get(key, 18)
+        if not bool(self.get_parameter("draw_debug_text").value):
+            return
         cv2.putText(
             frame,
             text,
-            (12, y),
+            (12, self._text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             scale,
             color,
             thickness,
             cv2.LINE_AA,
         )
-        self._text_y_by_frame_id[key] = y + 18
+        self._text_y += 18
 
-    def _draw_projection_debug_text(self, frame: np.ndarray, image_msg: Image) -> None:
-        """Draw compact status only; intentionally no camera-info/K/D text."""
+    def _draw_overlay_label(
+        self,
+        frame: np.ndarray,
+        text: str,
+        origin: Tuple[int, int],
+        color: Tuple[int, int, int],
+        scale: float = 0.5,
+        thickness: int = 2,
+    ) -> None:
+        if not bool(self.get_parameter("draw_debug_text").value):
+            return
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    def _draw_projection_debug_text(
+        self,
+        frame: np.ndarray,
+        image_msg: Image,
+        source_width: int,
+        source_height: int,
+        scale: float,
+        pad_x: int,
+        pad_y: int,
+    ) -> None:
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         image_frame_id = str(getattr(image_msg.header, "frame_id", ""))
         configured_camera_frame = str(self.get_parameter("top_camera_frame").value)
@@ -486,12 +855,12 @@ class SceneLocalizerDebugNode(Node):
 
         self._draw_status_text(
             frame,
-            f"top_cam image: {int(getattr(image_msg, 'width', 0))}x{int(getattr(image_msg, 'height', 0))} frame={image_frame_id}",
+            f"src={source_width}x{source_height} -> out=640x480 scale={scale:.3f} pad=({pad_x},{pad_y})",
             (255, 255, 255),
         )
         self._draw_status_text(
             frame,
-            f"configured camera frame: {configured_camera_frame}",
+            f"frame={image_frame_id} configured_camera_frame={configured_camera_frame}",
             (255, 255, 255),
         )
         self._draw_status_text(frame, f"table_pose_camera age: {table_pose_age}", (255, 255, 255))
@@ -501,10 +870,13 @@ class SceneLocalizerDebugNode(Node):
     def _draw_detection_overlay(
         self,
         frame: np.ndarray,
-        camera_info: CameraInfo,
         detections_msg: ArucoDetection,
         physical_marker_size: float,
         axis_length: float,
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
     ) -> None:
         markers = self._extract_markers_from_msg(detections_msg)
         if not markers:
@@ -533,10 +905,7 @@ class SceneLocalizerDebugNode(Node):
             if pose is None:
                 continue
 
-            t_cm = np.array(
-                [pose.position.x, pose.position.y, pose.position.z],
-                dtype=float,
-            )
+            t_cm = np.array([pose.position.x, pose.position.y, pose.position.z], dtype=float)
             q_cm = np.array(
                 [
                     pose.orientation.x,
@@ -548,38 +917,38 @@ class SceneLocalizerDebugNode(Node):
             )
             r_cm = _quaternion_to_matrix_xyzw(q_cm)
 
-            square_pixels: List[Tuple[int, int]] = []
-            for p_local in square_local:
-                p_cam = r_cm @ p_local + t_cm
-                uv = self._project_point(camera_info, p_cam)
-                if uv is None:
-                    square_pixels = []
-                    break
-                square_pixels.append(uv)
+            points_cam = np.vstack(
+                [
+                    (r_cm @ square_local.T).T + t_cm,
+                    (r_cm @ origin) + t_cm,
+                    (r_cm @ axis_x) + t_cm,
+                    (r_cm @ axis_y) + t_cm,
+                    (r_cm @ axis_z) + t_cm,
+                    t_cm,
+                ]
+            )
+            projected = self._project_points(points_cam, K, D, image_width, image_height)
 
-            center_uv = self._project_point(camera_info, t_cm)
+            square_pixels = projected[0:4]
+            origin_uv = projected[4]
+            x_uv = projected[5]
+            y_uv = projected[6]
+            z_uv = projected[7]
+            center_uv = projected[8]
 
-            origin_uv = self._project_point(camera_info, r_cm @ origin + t_cm)
-            x_uv = self._project_point(camera_info, r_cm @ axis_x + t_cm)
-            y_uv = self._project_point(camera_info, r_cm @ axis_y + t_cm)
-            z_uv = self._project_point(camera_info, r_cm @ axis_z + t_cm)
-
-            if square_pixels:
+            if all(p is not None for p in square_pixels):
                 pts = np.array(square_pixels, dtype=np.int32).reshape((-1, 1, 2))
                 cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 255), thickness=2)
 
             if center_uv is not None:
                 cv2.circle(frame, center_uv, 4, (255, 255, 0), -1)
                 label = f"id:{marker_id}" if marker_id is not None else "id:?"
-                cv2.putText(
+                self._draw_overlay_label(
                     frame,
                     label,
                     (center_uv[0] + 6, center_uv[1] - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
                     (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
+                    scale=0.55,
                 )
 
             if origin_uv is not None and x_uv is not None:
@@ -589,11 +958,18 @@ class SceneLocalizerDebugNode(Node):
             if origin_uv is not None and z_uv is not None:
                 cv2.line(frame, origin_uv, z_uv, (255, 0, 0), 2)
 
-    def _draw_table_rectangle_overlay(self, frame: np.ndarray, camera_info: CameraInfo) -> None:
+    def _draw_table_rectangle_overlay(
+        self,
+        frame: np.ndarray,
+        T_cam_table: Optional[np.ndarray],
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
+    ) -> None:
         if not bool(self.get_parameter("draw_table_rectangle").value):
             return
 
-        T_cam_table = self._get_camera_from_table_transform(self.get_clock().now().nanoseconds * 1e-9)
         if T_cam_table is None:
             self._draw_status_text(frame, "no/stale table_pose_camera", (0, 0, 255))
             return
@@ -609,53 +985,56 @@ class SceneLocalizerDebugNode(Node):
             np.array([0.0, table_longedge, table_edge_z], dtype=float),
         ]
 
-        corners_cam = [_transform_point(T_cam_table, p_table) for p_table in corners_table]
-        projected: List[Optional[Tuple[int, int]]] = [
-            self._project_point(camera_info, p_cam) for p_cam in corners_cam
-        ]
+        corners_cam = np.vstack([_transform_point(T_cam_table, p_table) for p_table in corners_table])
+        projected = self._project_points(corners_cam, K, D, image_width, image_height)
         visible_count = sum(1 for p in projected if p is not None)
 
-        # (0,1): short edge at wall
-        # (1,2): long edge away from wall
-        # (2,3): short edge away from wall
-        # (3,0): long edge at wall
         edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
-
-        drawn_edge_count = 0
+        clipped_segments: List[Tuple[np.ndarray, np.ndarray]] = []
         for i0, i1 in edges:
             clipped = self._clip_camera_edge_to_near_plane(corners_cam[i0], corners_cam[i1])
-            if clipped is None:
-                continue
+            if clipped is not None:
+                clipped_segments.append(clipped)
 
-            p0_cam, p1_cam = clipped
-            p0_uv = self._project_point(camera_info, p0_cam)
-            p1_uv = self._project_point(camera_info, p1_cam)
-            if p0_uv is None or p1_uv is None:
-                continue
-
-            cv2.line(frame, p0_uv, p1_uv, (0, 0, 255), 3)
-            drawn_edge_count += 1
+        drawn_edge_count = 0
+        if clipped_segments:
+            edge_points = np.vstack([np.vstack(seg) for seg in clipped_segments])
+            edge_uv = self._project_points(edge_points, K, D, image_width, image_height)
+            for i in range(0, len(edge_uv), 2):
+                p0_uv = edge_uv[i]
+                p1_uv = edge_uv[i + 1]
+                if p0_uv is None or p1_uv is None:
+                    continue
+                cv2.line(frame, p0_uv, p1_uv, (0, 0, 255), 3)
+                drawn_edge_count += 1
 
         labels = ["origin", "x", "x+y", "y"]
         for idx, point in enumerate(projected):
             if point is None:
                 continue
             cv2.circle(frame, point, 4, (0, 0, 255), -1)
-            cv2.putText(
+            self._draw_overlay_label(
                 frame,
                 labels[idx],
                 (point[0] + 6, point[1] - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
                 (0, 0, 255),
-                1,
-                cv2.LINE_AA,
+                scale=0.45,
+                thickness=1,
             )
 
         if drawn_edge_count == 0 and visible_count == 0:
             self._draw_status_text(frame, "table rectangle not visible/projectable", (0, 0, 255))
 
-    def _draw_ball_trajectory_overlay(self, frame: np.ndarray, camera_info: CameraInfo) -> None:
+    def _draw_ball_trajectory_overlay(
+        self,
+        frame: np.ndarray,
+        now_sec: float,
+        T_cam_table: Optional[np.ndarray],
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
+    ) -> None:
         """Project-only trajectory visualization.
 
         The ball_trajectory_estimator is responsible for deciding whether a
@@ -663,19 +1042,18 @@ class SceneLocalizerDebugNode(Node):
         BallTrajectory message. In the current contract:
             start_point = latest fitted ball point in the z=ball_radius plane
             end_point   = middle-line intersection/hit point
+
+        The captured middle-line (pink) overlay is persistent scene state and
+        is drawn independently by _draw_captured_middle_line_overlay(); it is
+        intentionally not nested inside this method so it keeps being drawn
+        regardless of ball-trajectory validity/staleness.
         """
-        now_sec = self.get_clock().now().nanoseconds * 1e-9
         self._draw_status_text(frame, f"traj_overlay now={now_sec:.3f}s", (200, 200, 200))
 
-        T_cam_table = self._get_camera_from_table_transform(now_sec)
         if T_cam_table is None:
             self._draw_status_text(frame, "T_cam_table: unavailable", (0, 140, 255))
             self._draw_status_text(frame, "no/stale T_camera_table", (0, 140, 255))
             return
-
-        T_table_tcp = self._compute_table_tcp_transform(now_sec, T_cam_table)
-        if bool(self.get_parameter("draw_tcp_middle_line").value):
-            self._draw_tcp_middle_line_overlay(frame, camera_info, now_sec, T_cam_table, T_table_tcp)
 
         traj = self._latest_ball_trajectory
         if traj is None or self._latest_ball_trajectory_time_sec is None:
@@ -762,45 +1140,41 @@ class SceneLocalizerDebugNode(Node):
 
         drawn = self._draw_table_segment(
             frame=frame,
-            camera_info=camera_info,
             T_cam_table=T_cam_table,
             p0_table=p0_table,
             p1_table=p1_table,
             color=line_color,
             thickness=line_thickness,
+            K=K,
+            D=D,
+            image_width=image_width,
+            image_height=image_height,
             arrow=True,
         )
         if not drawn:
             self._draw_status_text(frame, "valid trajectory not projectable", (0, 140, 255))
             return
 
-        p0_uv = self._project_table_point(camera_info, T_cam_table, p0_table)
-        p1_uv = self._project_table_point(camera_info, T_cam_table, p1_table)
+        p_table = np.vstack([p0_table, p1_table])
+        p_uv = self._project_table_points(p_table, T_cam_table, K, D, image_width, image_height)
+        p0_uv, p1_uv = p_uv[0], p_uv[1]
 
         if p0_uv is not None:
             cv2.circle(frame, p0_uv, start_radius, start_color, -1)
-            cv2.putText(
+            self._draw_overlay_label(
                 frame,
                 "ball",
                 (p0_uv[0] + 7, p0_uv[1] - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
                 start_color,
-                2,
-                cv2.LINE_AA,
             )
 
         if p1_uv is not None:
             cv2.circle(frame, p1_uv, hit_radius, hit_color, -1)
-            cv2.putText(
+            self._draw_overlay_label(
                 frame,
                 "hit",
                 (p1_uv[0] + 7, p1_uv[1] - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
                 hit_color,
-                2,
-                cv2.LINE_AA,
             )
 
     def _get_camera_from_table_transform(self, now_sec: float) -> Optional[np.ndarray]:
@@ -833,43 +1207,7 @@ class SceneLocalizerDebugNode(Node):
                 2.0,
             )
 
-        transform = _pose_to_transform(self._top.latest_table_pose.pose)
-        translation = transform[:3, 3]
-        self._warn_throttled(
-            "top_table_pose_ok",
-            "top_table_pose accepted: "
-            f"age={pose_age_sec:.3f}s frame='{header_frame or 'n/a'}' "
-            f"T_cam_table.xyz=({translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f})",
-            1.0,
-        )
-
-        return transform
-
-    def _compute_table_tcp_transform(
-        self,
-        now_sec: float,
-        T_cam_table: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        """Compute T_table_tcp from robot-base table pose and TF base->tcp.
-
-        Correct chain for the current top-cam-only setup:
-            T_table_tcp = inverse(T_base_table) * T_base_tcp
-
-        T_base_table comes from /scene_localizer/table_pose_robot_base. If that
-        is not available and allow_base_table_fallback_from_tf is true, it is
-        reconstructed as:
-            T_base_table = T_base_top_camera * T_top_camera_table
-        using TF base->camera plus the top table pose.
-        """
-        T_base_table = self._get_robot_base_from_table_transform(now_sec, T_cam_table)
-        if T_base_table is None:
-            return None
-
-        T_base_tcp = self._lookup_robot_base_from_tcp_transform()
-        if T_base_tcp is None:
-            return None
-
-        return _invert_transform(T_base_table) @ T_base_tcp
+        return _pose_to_transform(self._top.latest_table_pose.pose)
 
     def _get_robot_base_from_table_transform(
         self,
@@ -906,11 +1244,6 @@ class SceneLocalizerDebugNode(Node):
         top_camera_frame = str(self.get_parameter("top_camera_frame").value)
         return self._lookup_transform_matrix(robot_base_frame, top_camera_frame, "base_to_camera")
 
-    def _lookup_robot_base_from_tcp_transform(self) -> Optional[np.ndarray]:
-        robot_base_frame = str(self.get_parameter("robot_base_frame").value)
-        tcp_frame = str(self.get_parameter("tcp_frame").value)
-        return self._lookup_transform_matrix(robot_base_frame, tcp_frame, "base_to_tcp")
-
     def _lookup_transform_matrix(
         self,
         target_frame: str,
@@ -934,109 +1267,129 @@ class SceneLocalizerDebugNode(Node):
             return None
         return _transform_stamped_to_matrix(transform)
 
-    def _draw_tcp_middle_line_overlay(
+    def _draw_captured_middle_line_overlay(
         self,
         frame: np.ndarray,
-        camera_info: CameraInfo,
-        now_sec: float,
-        T_cam_table: np.ndarray,
-        T_table_tcp: Optional[np.ndarray],
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
     ) -> None:
-        """Draw the TCP-attached middle line at z=ball_radius in table frame.
+        """Draw the authoritative captured middle line.
 
-        Construction:
-        1. Take the TCP origin in table frame.
-        2. Project it down to the table x-y plane -> Q = [tcp_x, tcp_y, 0].
-        3. Lift Q by ball_radius -> anchor = [tcp_x, tcp_y, ball_radius].
-        4. Draw from anchor along robot-base +x expressed in table coordinates.
+        Geometry comes only from the cached MiddleLine state (published by
+        trajectory_executor on middle_line_state_topic) and a direct TF
+        lookup from the message's frame to the camera frame. This overlay
+        intentionally does not depend on the live TCP pose, T_table_tcp,
+        table-pose estimation, or ball-trajectory state, so it does not move
+        when the robot moves and remains visible even if those other inputs
+        are unavailable or stale.
         """
         pink = (180, 105, 255)
 
-        if T_table_tcp is None:
+        line = self._latest_middle_line
+        if line is None:
+            self._draw_status_text(frame, "middle line: waiting for captured state", pink)
+            return
+
+        line_frame = str(line.header.frame_id).strip("/")
+        if not line_frame:
+            self._warn_throttled(
+                "middle_line_frame_empty",
+                "Captured middle-line message has an empty header.frame_id; cannot draw.",
+                2.0,
+            )
+            self._draw_status_text(frame, "middle line: empty frame_id", pink)
+            return
+
+        camera_frame = str(self.get_parameter("top_camera_frame").value).strip("/")
+
+        # _lookup_transform_matrix(target_frame, source_frame, ...) returns
+        # T_target_source. We need camera-from-line (T_camera_line), i.e.
+        # target=camera_frame, source=line_frame -- not the inverse.
+        T_camera_line = self._lookup_transform_matrix(
+            camera_frame,
+            line_frame,
+            "camera_from_middle_line",
+        )
+        if T_camera_line is None:
             self._draw_status_text(
                 frame,
-                "no T_table_tcp: need T_base_table and TF base->tcp",
+                f"middle line: no TF {camera_frame} <- {line_frame}",
                 pink,
             )
             return
 
-        T_base_table = self._get_robot_base_from_table_transform(now_sec, T_cam_table)
-        if T_base_table is None:
-            self._draw_status_text(frame, "no T_base_table for robot-base-x middle line", pink)
-            return
-
-        tcp_origin_table = T_table_tcp[:3, 3].copy()
-        ball_radius = max(0.0, float(self.get_parameter("ball_radius").value))
-
-        # Express robot-base +x in table coordinates. Since T_base_table maps
-        # table -> base, its inverse rotation maps base vectors -> table.
-        robot_base_x_table = T_base_table[:3, :3].T @ np.array([1.0, 0.0, 0.0], dtype=float)
-        robot_base_x_table = robot_base_x_table.astype(float)
-        robot_base_x_table[2] = 0.0
-        direction_norm = float(np.linalg.norm(robot_base_x_table))
-        if direction_norm < 1e-9:
-            self._draw_status_text(frame, "robot-base-x projection degenerate in table xy", pink)
-            return
-        robot_base_x_table /= direction_norm
-
-        anchor_table = np.array(
-            [tcp_origin_table[0], tcp_origin_table[1], ball_radius],
+        center_line = np.array(
+            [float(line.center.x), float(line.center.y), float(line.center.z)],
             dtype=float,
         )
-        q_table = np.array(
-            [tcp_origin_table[0], tcp_origin_table[1], 0.0],
+        direction_line = np.array(
+            [float(line.direction.x), float(line.direction.y), float(line.direction.z)],
             dtype=float,
         )
+        if not _is_finite_vector(center_line) or not _is_finite_vector(direction_line):
+            self._draw_status_text(frame, "middle line: cached geometry non-finite", pink)
+            return
 
-        configured_length = float(self.get_parameter("tcp_middle_line_length").value)
-        if configured_length <= 0.0:
-            configured_length = float(self.get_parameter("table_shortedge").value)
-        line_length = max(0.0, configured_length)
+        direction_norm = float(np.linalg.norm(direction_line))
+        if direction_norm <= 1e-9:
+            self._draw_status_text(frame, "middle line: cached direction degenerate", pink)
+            return
+        direction_line = direction_line / direction_norm
 
-        p_start_table = anchor_table - line_length * robot_base_x_table
-        p_end_table = anchor_table + line_length * robot_base_x_table
+        half_length = float(line.half_length)
+        if not np.isfinite(half_length) or half_length <= 0.0:
+            self._draw_status_text(frame, "middle line: cached half_length invalid", pink)
+            return
+
+        # Published Z is used unchanged: not ball_radius, not table Z, not
+        # live TCP Z, and not any other configured overlay height.
+        p_start_line = center_line - half_length * direction_line
+        p_end_line = center_line + half_length * direction_line
+
+        p_start_cam = _transform_point(T_camera_line, p_start_line)
+        p_end_cam = _transform_point(T_camera_line, p_end_line)
+        center_cam = _transform_point(T_camera_line, center_line)
+
+        clipped = self._clip_camera_edge_to_near_plane(p_start_cam, p_end_cam)
+        if clipped is None:
+            self._draw_status_text(frame, "middle line: not projectable (behind camera)", pink)
+            return
+        c_start_cam, c_end_cam = clipped
+
+        proj = self._project_points(
+            np.vstack([c_start_cam, c_end_cam, center_cam]),
+            K,
+            D,
+            image_width,
+            image_height,
+        )
+        p_start_uv, p_end_uv, center_uv = proj[0], proj[1], proj[2]
+
+        if p_start_uv is None or p_end_uv is None:
+            self._draw_status_text(frame, "middle line: not projectable", pink)
+            return
 
         thickness = max(1, int(self.get_parameter("tcp_middle_line_thickness").value))
+        cv2.line(frame, p_start_uv, p_end_uv, pink, thickness)
 
-        drawn = self._draw_table_segment(
-            frame=frame,
-            camera_info=camera_info,
-            T_cam_table=T_cam_table,
-            p0_table=p_start_table,
-            p1_table=p_end_table,
-            color=pink,
-            thickness=thickness,
-            arrow=False,
-        )
-
-        anchor_uv = self._project_table_point(camera_info, T_cam_table, anchor_table)
-        if anchor_uv is not None:
-            cv2.circle(frame, anchor_uv, 4, pink, -1)
-            cv2.putText(
+        if center_uv is not None:
+            cv2.circle(frame, center_uv, 4, pink, -1)
+            self._draw_overlay_label(
                 frame,
-                "Q+ball_r",
-                (anchor_uv[0] + 7, anchor_uv[1] - 7),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
+                "captured line",
+                (center_uv[0] + 7, center_uv[1] - 7),
                 pink,
-                2,
-                cv2.LINE_AA,
+                scale=0.45,
             )
-
-        q_uv = self._project_table_point(camera_info, T_cam_table, q_table)
-        if q_uv is not None:
-            cv2.circle(frame, q_uv, 3, (160, 160, 160), -1)
 
         self._draw_status_text(
             frame,
-            f"middle line: Q=({q_table[0]:.3f},{q_table[1]:.3f},0), "
-            f"z=ball_r={ball_radius:.3f}, len={line_length:.3f}, "
-            f"dir_base_x_table=({robot_base_x_table[0]:.3f},{robot_base_x_table[1]:.3f})",
-            (200, 200, 200),
+            f"middle line rev={self._latest_middle_line_revision} "
+            f"half={half_length:.3f} total={2.0 * half_length:.3f} frame={line_frame}",
+            pink,
         )
-
-        if not drawn:
-            self._draw_status_text(frame, "robot-base-x middle line not projectable", pink)
 
     def _compute_trajectory_intersection_table(
         self,
@@ -1063,7 +1416,7 @@ class SceneLocalizerDebugNode(Node):
         else:
             direction_table = p1_table - p0_table
 
-        direction_norm = float(np.linalg.norm(direction_table))
+        direction_norm = float(np.linalg.norm(direction_table)) 
         if direction_norm < 1e-9:
             return None
         direction_table = direction_table / direction_norm
@@ -1136,26 +1489,33 @@ class SceneLocalizerDebugNode(Node):
         hit_table = 0.5 * (closest_on_ball + closest_on_axis)
         return hit_table if _is_finite_vector(hit_table) else None
 
-    def _project_table_point(
+    def _project_table_points(
         self,
-        camera_info: CameraInfo,
+        points_table: np.ndarray,
         T_cam_table: np.ndarray,
-        p_table: np.ndarray,
-    ) -> Optional[Tuple[int, int]]:
-        if not _is_finite_vector(p_table):
-            return None
-        p_cam = _transform_point(T_cam_table, p_table)
-        return self._project_point(camera_info, p_cam)
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
+    ) -> List[Optional[Tuple[int, int]]]:
+        if points_table.ndim != 2 or points_table.shape[1] != 3:
+            return []
+        points_cam = (_transform_point(T_cam_table, p_table) for p_table in points_table)
+        points_cam_np = np.vstack(list(points_cam))
+        return self._project_points(points_cam_np, K, D, image_width, image_height)
 
     def _draw_table_segment(
         self,
         frame: np.ndarray,
-        camera_info: CameraInfo,
         T_cam_table: np.ndarray,
         p0_table: np.ndarray,
         p1_table: np.ndarray,
         color: Tuple[int, int, int],
         thickness: int,
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
         arrow: bool = False,
     ) -> bool:
         if not _is_finite_vector(p0_table) or not _is_finite_vector(p1_table):
@@ -1166,10 +1526,12 @@ class SceneLocalizerDebugNode(Node):
         if clipped is None:
             return False
         c0_cam, c1_cam = clipped
-        p0_uv = self._project_point(camera_info, c0_cam)
-        p1_uv = self._project_point(camera_info, c1_cam)
+
+        proj = self._project_points(np.vstack([c0_cam, c1_cam]), K, D, image_width, image_height)
+        p0_uv, p1_uv = proj[0], proj[1]
         if p0_uv is None or p1_uv is None:
             return False
+
         if arrow:
             cv2.arrowedLine(frame, p0_uv, p1_uv, color, thickness, tipLength=0.12)
         else:
@@ -1247,37 +1609,50 @@ class SceneLocalizerDebugNode(Node):
                 return stamp_sec
         return self.get_clock().now().nanoseconds * 1e-9
 
-    @staticmethod
-    def _project_point(camera_info: CameraInfo, point_cam: np.ndarray) -> Optional[Tuple[int, int]]:
-        if point_cam.shape != (3,):
-            return None
+    def _project_points(
+        self,
+        points_cam: np.ndarray,
+        K: np.ndarray,
+        D: Optional[np.ndarray],
+        image_width: int,
+        image_height: int,
+    ) -> List[Optional[Tuple[int, int]]]:
+        if points_cam.ndim != 2 or points_cam.shape[1] != 3:
+            return []
 
-        x, y, z = float(point_cam[0]), float(point_cam[1]), float(point_cam[2])
-        if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z) or z <= 1e-9:
-            return None
+        n_points = points_cam.shape[0]
+        result: List[Optional[Tuple[int, int]]] = [None] * n_points
 
-        if len(camera_info.k) < 9:
-            return None
+        finite_mask = np.all(np.isfinite(points_cam), axis=1)
+        z_mask = points_cam[:, 2] > 1e-9
+        valid_mask = finite_mask & z_mask
 
-        k = np.asarray(camera_info.k, dtype=float).reshape(3, 3)
-        if not np.all(np.isfinite(k)):
-            return None
+        if not np.any(valid_mask):
+            return result
 
-        dist_coeffs = np.asarray(camera_info.d, dtype=float).reshape(-1, 1) if len(camera_info.d) > 0 else None
-        object_points = np.array([[[x, y, z]]], dtype=np.float64)
-        rvec = np.zeros((3, 1), dtype=np.float64)
-        tvec = np.zeros((3, 1), dtype=np.float64)
+        valid_idx = np.where(valid_mask)[0]
+        valid_points = points_cam[valid_mask]
 
-        image_points, _ = cv2.projectPoints(object_points, rvec, tvec, k, dist_coeffs)
-        if image_points is None or image_points.shape[0] == 0:
-            return None
+        if self._camera_projection_is_rectified:
+            x = valid_points[:, 0]
+            y = valid_points[:, 1]
+            z = valid_points[:, 2]
+            u = (K[0, 0] * x / z) + K[0, 2]
+            v = (K[1, 1] * y / z) + K[1, 2]
+            uv = np.column_stack((u, v))
+        else:
+            object_points = valid_points.reshape((-1, 1, 3)).astype(np.float64)
+            image_points, _ = cv2.projectPoints(object_points, self._zero_rvec, self._zero_tvec, K, D)
+            uv = image_points.reshape((-1, 2))
 
-        u = float(image_points[0, 0, 0])
-        v = float(image_points[0, 0, 1])
-        if not np.isfinite(u) or not np.isfinite(v):
-            return None
+        for i_local, i_global in enumerate(valid_idx):
+            u = float(uv[i_local, 0])
+            v = float(uv[i_local, 1])
+            if not np.isfinite(u) or not np.isfinite(v):
+                continue
+            result[i_global] = (int(round(u)), int(round(v)))
 
-        return int(round(u)), int(round(v))
+        return result
 
     @staticmethod
     def _clip_camera_edge_to_near_plane(

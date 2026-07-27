@@ -19,7 +19,7 @@ def generate_launch_description():
         executable="scene_localizer",
         name="scene_localizer",
         output="screen",
-        parameters=[f"{config_dir}/ball_trajectory_estimator.yaml"],
+        parameters=[f"{config_dir}/scene_localizer.yaml"],
         condition=UnlessCondition(inhibit_scene_localizer),
     )
 

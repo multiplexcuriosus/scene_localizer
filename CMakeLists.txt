@@ -12,6 +12,7 @@ find_package(builtin_interfaces REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(fr3_husky_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BallTrajectory.msg"
@@ -23,6 +24,13 @@ install(
     scene_localizer/scene_localizer_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME scene_localizer
+)
+
+install(
+  PROGRAMS
+    scene_localizer/table_pose_origin_projection.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME table_pose_origin_projection
 )
 
 install(
