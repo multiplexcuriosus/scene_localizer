@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -13,9 +14,14 @@ import yaml
 from ament_index_python.packages import get_package_share_directory
 from aruco_opencv_msgs.msg import ArucoDetection
 from geometry_msgs.msg import Pose, PointStamped, PoseStamped, TransformStamped
+from lifecycle_msgs.msg import Transition
+from lifecycle_msgs.srv import ChangeState
 from scene_localizer.msg import BallTrajectory
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 
@@ -28,6 +34,7 @@ class TransformEstimate:
 @dataclass
 class TimedMarkerObservation:
     stamp_sec: float
+    stamp_ns: int
     marker_id: int
     camera_marker: TransformEstimate
 
@@ -44,6 +51,7 @@ class TopCamState:
 
     # Last source timestamp involved in a newly accepted estimate.
     last_valid_source_stamp_sec: Optional[float] = None
+    last_valid_source_stamp_ns: Optional[int] = None
 
     # Optional extra smoothing state.
     last_published_estimate: Optional[TransformEstimate] = None
@@ -53,6 +61,15 @@ class TopCamState:
 class CalibrationYamlTransform:
     parent_frame: str
     child_frame: str
+    estimate: TransformEstimate
+
+
+@dataclass
+class StabilitySample:
+    source_stamp_ns: int
+    source_stamp_sec: float
+    translation: np.ndarray
+    quaternion_xyzw: np.ndarray
     estimate: TransformEstimate
 
 
@@ -242,6 +259,7 @@ class SceneLocalizerNode(Node):
         super().__init__("scene_localizer")
 
         self._last_warn_time_ns: Dict[str, int] = {}
+        self._freeze_lock = threading.Lock()
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_broadcaster = TransformBroadcaster(self)
@@ -317,7 +335,17 @@ class SceneLocalizerNode(Node):
         self.declare_parameter("publish_top_camera_table_tf", False)
         self.declare_parameter("top_camera_table_tf_child_frame", "top_cam_table_frame")
 
-        self.declare_parameter("debug_log", False)
+        self.declare_parameter("debug_log", True)
+        self.declare_parameter("freeze_stability_duration_sec", 5.0)
+        self.declare_parameter("freeze_max_translation_deviation_m", 0.05)
+        self.declare_parameter("freeze_max_rotation_deviation_deg", 10.0)
+        self.declare_parameter("freeze_max_detection_gap_sec", 0.50)
+        self.declare_parameter("freeze_max_percent_allowed_missing", 30.0)
+        self.declare_parameter("freeze_min_estimates", 20)
+        self.declare_parameter("freeze_required_marker_ids", [0, 1, 2, 3])
+        self.declare_parameter("freeze_skip_checks", True)
+        self.declare_parameter("freeze_verbose_debug", True)
+        self.declare_parameter("aruco_change_state_service", "/aruco_top_cam/aruco_top_cam/change_state")
 
         self._robot_base_frame = _clean_frame(self.get_parameter("robot_base_frame").value)
         self._calibration_link_frame = _clean_frame(self.get_parameter("calibration_link_frame").value)
@@ -341,6 +369,20 @@ class SceneLocalizerNode(Node):
         self._latest_ball_trajectory_time_sec: Optional[float] = None
         self._latest_ball_3d_point: Optional[PointStamped] = None
         self._latest_ball_3d_point_time_sec: Optional[float] = None
+
+        self._validate_freeze_parameters()
+        self._freeze_stability_samples: List[StabilitySample] = []
+        self._freeze_monitoring_active = False
+        self._table_pose_frozen = False
+        self._freeze_last_source_stamp_ns: Optional[int] = None
+        self._lifecycle_transition_pending = False
+        self._pending_lifecycle_transition_id: Optional[int] = None
+        self._pending_lifecycle_transition_name = ""
+        self._pending_lifecycle_transition_for_reacquire = False
+        self._aruco_change_state_client = self.create_client(
+            ChangeState,
+            str(self.get_parameter("aruco_change_state_service").value),
+        )
 
         valid_modes = {"marker_pose_average", "marker_center_alignment"}
         global_mode = str(self.get_parameter("estimation_mode").value)
@@ -397,8 +439,33 @@ class SceneLocalizerNode(Node):
             10,
         )
 
+        frozen_status_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._table_pose_frozen_pub = self.create_publisher(
+            Bool,
+            "/scene_localizer/table_pose_frozen",
+            frozen_status_qos,
+        )
+
+        self._freeze_srv = self.create_service(
+            Trigger,
+            "/scene_localizer/freeze_table_pose",
+            self._handle_freeze_table_pose,
+        )
+        self._reacquire_srv = self.create_service(
+            Trigger,
+            "/scene_localizer/reacquire_table_pose",
+            self._handle_reacquire_table_pose,
+        )
+
         publish_rate_hz = max(0.1, float(self.get_parameter("publish_rate_hz").value))
         self._publish_timer = self.create_timer(1.0 / publish_rate_hz, self._publish_timer_callback)
+
+        self._publish_table_pose_frozen_status()
 
         self.get_logger().info(f"Loaded marker layout YAML: {marker_layout_yaml}")
         self.get_logger().info(
@@ -428,9 +495,387 @@ class SceneLocalizerNode(Node):
                 f"transform={cal.parent_frame}->{cal.child_frame}"
             )
 
+    def _validate_freeze_parameters(self) -> None:
+        duration = float(self.get_parameter("freeze_stability_duration_sec").value)
+        if duration <= 0.0:
+            raise ValueError(f"freeze_stability_duration_sec must be > 0, got {duration}")
+
+        max_dt = float(self.get_parameter("freeze_max_translation_deviation_m").value)
+        if max_dt < 0.0:
+            raise ValueError(f"freeze_max_translation_deviation_m must be >= 0, got {max_dt}")
+
+        max_dr = float(self.get_parameter("freeze_max_rotation_deviation_deg").value)
+        if max_dr < 0.0:
+            raise ValueError(f"freeze_max_rotation_deviation_deg must be >= 0, got {max_dr}")
+
+        max_gap = float(self.get_parameter("freeze_max_detection_gap_sec").value)
+        if max_gap <= 0.0:
+            raise ValueError(f"freeze_max_detection_gap_sec must be > 0, got {max_gap}")
+
+        max_missing = float(self.get_parameter("freeze_max_percent_allowed_missing").value)
+        if max_missing < 0.0 or max_missing > 100.0:
+            raise ValueError(
+                "freeze_max_percent_allowed_missing must be in [0, 100], "
+                f"got {max_missing}"
+            )
+
+        min_est = int(self.get_parameter("freeze_min_estimates").value)
+        if min_est <= 0:
+            raise ValueError(f"freeze_min_estimates must be > 0, got {min_est}")
+
+    @staticmethod
+    def _stamp_to_ns(msg: Any) -> Optional[int]:
+        header = getattr(msg, "header", None)
+        if header is None or not hasattr(header, "stamp"):
+            return None
+        stamp = header.stamp
+        sec = int(getattr(stamp, "sec", 0))
+        nanosec = int(getattr(stamp, "nanosec", 0))
+        if sec == 0 and nanosec == 0:
+            return None
+        return sec * 1_000_000_000 + nanosec
+
+    def _publish_table_pose_frozen_status(self) -> None:
+        msg = Bool()
+        msg.data = bool(self._table_pose_frozen)
+        self._table_pose_frozen_pub.publish(msg)
+
+    def _freeze_required_marker_ids(self) -> List[int]:
+        configured = list(self.get_parameter("freeze_required_marker_ids").value)
+        out: List[int] = []
+        for marker_id in configured:
+            try:
+                out.append(int(marker_id))
+            except Exception:
+                continue
+        return out
+
+    def _freeze_required_markers_valid(self, source_stamp_sec: float) -> bool:
+        required = self._freeze_required_marker_ids()
+        if not required:
+            return True
+
+        max_gap = float(self.get_parameter("freeze_max_detection_gap_sec").value)
+        for marker_id in required:
+            observations = self._state.marker_buffers.get(marker_id, [])
+            if not observations:
+                return False
+            latest_stamp_sec = observations[-1].stamp_sec
+            if (source_stamp_sec - latest_stamp_sec) > max_gap:
+                return False
+        return True
+
+    def _freeze_marker_presence_ratio(
+        self,
+        marker_id: int,
+        start_sec: float,
+        end_sec: float,
+    ) -> float:
+        duration = float(end_sec - start_sec)
+        if duration <= 1e-9:
+            return 0.0
+
+        observations = self._state.marker_buffers.get(marker_id, [])
+        if not observations:
+            return 0.0
+
+        max_gap = float(self.get_parameter("freeze_max_detection_gap_sec").value)
+        if max_gap <= 0.0:
+            return 0.0
+
+        intervals: List[Tuple[float, float]] = []
+        for obs in observations:
+            interval_start = float(obs.stamp_sec)
+            interval_end = interval_start + max_gap
+            if interval_end <= start_sec:
+                continue
+            if interval_start >= end_sec:
+                break
+            intervals.append((max(start_sec, interval_start), min(end_sec, interval_end)))
+
+        if not intervals:
+            return 0.0
+
+        intervals.sort(key=lambda item: item[0])
+        covered = 0.0
+        cur_start, cur_end = intervals[0]
+        for seg_start, seg_end in intervals[1:]:
+            if seg_start <= cur_end:
+                cur_end = max(cur_end, seg_end)
+            else:
+                covered += max(0.0, cur_end - cur_start)
+                cur_start, cur_end = seg_start, seg_end
+        covered += max(0.0, cur_end - cur_start)
+
+        ratio = covered / duration
+        return max(0.0, min(1.0, float(ratio)))
+
+    def _freeze_required_markers_coverage_valid(
+        self,
+        start_sec: float,
+        end_sec: float,
+    ) -> bool:
+        required = self._freeze_required_marker_ids()
+        if not required:
+            return True
+
+        max_missing_percent = float(self.get_parameter("freeze_max_percent_allowed_missing").value)
+        min_presence_ratio = 1.0 - (max(0.0, min(100.0, max_missing_percent)) / 100.0)
+        self._freeze_debug(
+            "coverage check window: "
+            f"start={start_sec:.6f}s end={end_sec:.6f}s duration={max(0.0, end_sec - start_sec):.3f}s "
+            f"required_markers={required} min_presence_ratio={min_presence_ratio:.3f}"
+        )
+
+        for marker_id in required:
+            ratio = self._freeze_marker_presence_ratio(
+                marker_id=marker_id,
+                start_sec=start_sec,
+                end_sec=end_sec,
+            )
+            self._freeze_debug(
+                f"marker={marker_id} presence_ratio={ratio:.3f} "
+                f"allowed_missing_percent={max_missing_percent:.1f}"
+            )
+            if ratio + 1e-9 < min_presence_ratio:
+                self._warn_throttled(
+                    f"freeze_marker_presence_too_low_{marker_id}",
+                    "Freeze stability waiting: marker "
+                    f"{marker_id} presence ratio={ratio:.3f} below required {min_presence_ratio:.3f} "
+                    f"(max missing {max_missing_percent:.1f}%).",
+                    0.5,
+                )
+                return False
+        return True
+
+    def _clear_stability_segment(self) -> None:
+        self._freeze_stability_samples.clear()
+
+    def _restart_stability_segment_with(self, sample: StabilitySample) -> None:
+        self._freeze_stability_samples = [sample]
+
+    def _stable_segment_stats(self) -> Optional[Tuple[float, np.ndarray, np.ndarray, float, float]]:
+        if not self._freeze_stability_samples:
+            return None
+
+        translations = np.stack([s.translation for s in self._freeze_stability_samples], axis=0)
+        translation_mean = np.mean(translations, axis=0)
+        translation_devs = np.linalg.norm(translations - translation_mean, axis=1)
+        max_translation_dev = float(np.max(translation_devs))
+
+        quats = [s.quaternion_xyzw for s in self._freeze_stability_samples]
+        quat_mean = _average_quaternions_xyzw(quats)
+        max_rot_dev = 0.0
+        for q in quats:
+            max_rot_dev = max(max_rot_dev, _quaternion_angular_distance_deg(quat_mean, q))
+
+        duration_sec = (
+            self._freeze_stability_samples[-1].source_stamp_sec
+            - self._freeze_stability_samples[0].source_stamp_sec
+        )
+        return duration_sec, translation_mean, quat_mean, max_translation_dev, max_rot_dev
+
+    def _request_aruco_change_state_async(self, transition_id: int, for_reacquire: bool) -> bool:
+        with self._freeze_lock:
+            if self._lifecycle_transition_pending:
+                return False
+
+        if not self._aruco_change_state_client.service_is_ready():
+            self._warn_throttled(
+                "aruco_change_state_unavailable",
+                "Table pose is frozen but ArUco lifecycle change_state service is unavailable; ArUco remains active.",
+                1.0,
+            )
+            return False
+
+        req = ChangeState.Request()
+        req.transition.id = int(transition_id)
+        req.transition.label = ""
+
+        with self._freeze_lock:
+            self._lifecycle_transition_pending = True
+            self._pending_lifecycle_transition_id = int(transition_id)
+            self._pending_lifecycle_transition_name = (
+                "activate" if for_reacquire else "deactivate"
+            )
+            self._pending_lifecycle_transition_for_reacquire = bool(for_reacquire)
+
+        try:
+            future = self._aruco_change_state_client.call_async(req)
+        except Exception as exc:
+            with self._freeze_lock:
+                self._lifecycle_transition_pending = False
+                self._pending_lifecycle_transition_id = None
+                self._pending_lifecycle_transition_name = ""
+                self._pending_lifecycle_transition_for_reacquire = False
+            self._warn_throttled(
+                "aruco_change_state_call_failed",
+                f"Failed to request ArUco lifecycle transition: {exc}",
+                1.0,
+            )
+            return False
+
+        future.add_done_callback(self._on_aruco_change_state_done)
+        return True
+
+    def _on_aruco_change_state_done(self, future: Any) -> None:
+        with self._freeze_lock:
+            transition_name = self._pending_lifecycle_transition_name
+            transition_for_reacquire = self._pending_lifecycle_transition_for_reacquire
+            self._lifecycle_transition_pending = False
+            self._pending_lifecycle_transition_id = None
+            self._pending_lifecycle_transition_name = ""
+            self._pending_lifecycle_transition_for_reacquire = False
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            if transition_for_reacquire:
+                self._warn_throttled(
+                    "aruco_activate_exception",
+                    f"ArUco reactivation request failed: {exc}. Table pose remains frozen.",
+                    1.0,
+                )
+            else:
+                self._warn_throttled(
+                    "aruco_deactivate_exception",
+                    f"Table pose frozen, but ArUco deactivation request failed: {exc}.",
+                    1.0,
+                )
+            return
+
+        success = bool(getattr(result, "success", False))
+        if transition_for_reacquire:
+            if not success:
+                self._warn_throttled(
+                    "aruco_activate_failed",
+                    "ArUco activation failed; table pose remains frozen.",
+                    1.0,
+                )
+                return
+
+            with self._freeze_lock:
+                self._table_pose_frozen = False
+                self._freeze_monitoring_active = False
+                self._clear_stability_segment()
+                self._freeze_last_source_stamp_ns = None
+            self._publish_table_pose_frozen_status()
+            self.get_logger().info("ArUco lifecycle activated; table pose reacquisition resumed.")
+            return
+
+        if not success:
+            self._warn_throttled(
+                "aruco_deactivate_failed",
+                "Table pose frozen, but ArUco lifecycle deactivation failed; ArUco remains active.",
+                1.0,
+            )
+            return
+
+        self.get_logger().info(f"ArUco lifecycle transition '{transition_name}' succeeded.")
+
+    def _handle_freeze_table_pose(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        del request
+        duration = float(self.get_parameter("freeze_stability_duration_sec").value)
+        skip_checks = bool(self.get_parameter("freeze_skip_checks").value)
+        retry_deactivate = False
+        publish_frozen_status = False
+        with self._freeze_lock:
+            if self._table_pose_frozen:
+                response.success = True
+                response.message = "Table pose is already frozen."
+                retry_deactivate = not self._lifecycle_transition_pending
+            elif skip_checks:
+                latest_estimate = self._state.last_valid_estimate
+                if latest_estimate is None:
+                    response.success = False
+                    response.message = (
+                        "freeze_skip_checks=true, but no valid table pose is available yet; "
+                        "cannot freeze immediately."
+                    )
+                    return response
+
+                frozen_estimate = TransformEstimate(
+                    translation=np.array(latest_estimate.translation, dtype=float),
+                    quaternion_xyzw=_normalize_quaternion_xyzw(
+                        np.array(latest_estimate.quaternion_xyzw, dtype=float)
+                    ),
+                )
+                self._state.last_valid_estimate = frozen_estimate
+                self._state.last_published_estimate = frozen_estimate
+                self._table_pose_frozen = True
+                self._freeze_monitoring_active = False
+                self._clear_stability_segment()
+                self._freeze_last_source_stamp_ns = None
+                publish_frozen_status = True
+                retry_deactivate = not self._lifecycle_transition_pending
+                response.success = True
+                response.message = "Table pose frozen immediately (freeze_skip_checks=true)."
+            elif self._freeze_monitoring_active:
+                response.success = True
+                response.message = "Table-pose stability monitoring is already active."
+                return response
+
+            else:
+                self._freeze_monitoring_active = True
+                self._clear_stability_segment()
+                self._freeze_last_source_stamp_ns = None
+
+        if publish_frozen_status:
+            self._freeze_debug("freeze service bypass enabled: skipping stability checks and freezing immediately")
+            self._publish_table_pose_frozen_status()
+
+        if retry_deactivate:
+            self._request_aruco_change_state_async(
+                Transition.TRANSITION_DEACTIVATE,
+                for_reacquire=False,
+            )
+            return response
+
+        if publish_frozen_status:
+            return response
+
+        response.success = True
+        response.message = (
+            "Table-pose stability monitoring armed; "
+            f"waiting for {duration:.1f} s of stable fresh ArUco estimates."
+        )
+        return response
+
+    def _handle_reacquire_table_pose(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        del request
+        with self._freeze_lock:
+            if self._lifecycle_transition_pending:
+                response.success = True
+                response.message = "ArUco lifecycle transition already pending."
+                return response
+
+            frozen = self._table_pose_frozen
+
+        if not frozen:
+            response.success = True
+            response.message = "Table pose is not frozen; reacquisition is already active."
+            return response
+
+        requested = self._request_aruco_change_state_async(
+            Transition.TRANSITION_ACTIVATE,
+            for_reacquire=True,
+        )
+        if not requested:
+            response.success = False
+            response.message = "Failed to request ArUco activation; table pose remains frozen."
+            return response
+
+        response.success = True
+        response.message = "ArUco reactivation requested; table pose will unfreeze after activation succeeds."
+        return response
+
     def _log_debug(self, message: str) -> None:
         if bool(self.get_parameter("debug_log").value):
             self.get_logger().info(message)
+
+    def _freeze_debug(self, message: str) -> None:
+        if bool(self.get_parameter("debug_log").value) and bool(self.get_parameter("freeze_verbose_debug").value):
+            self.get_logger().info(f"[freeze-debug] {message}")
 
     def _warn_throttled(self, key: str, message: str, throttle_sec: float = 1.0) -> None:
         now_ns = self.get_clock().now().nanoseconds
@@ -590,8 +1035,13 @@ class SceneLocalizerNode(Node):
         self._publish_table_ball_3d_tf_if_available()
 
     def _handle_top_detection_message(self, msg: ArucoDetection) -> None:
+        with self._freeze_lock:
+            if self._table_pose_frozen:
+                return
+
         markers = self._extract_markers_from_msg(msg)
         stamp_sec = self._stamp_to_sec(msg)
+        stamp_ns = self._stamp_to_ns(msg)
 
         if not markers:
             self._warn_throttled(
@@ -657,6 +1107,7 @@ class SceneLocalizerNode(Node):
 
             observation = TimedMarkerObservation(
                 stamp_sec=stamp_sec,
+                stamp_ns=(stamp_ns if stamp_ns is not None else int(round(stamp_sec * 1e9))),
                 marker_id=marker_id,
                 camera_marker=TransformEstimate(
                     translation=translation,
@@ -950,7 +1401,12 @@ class SceneLocalizerNode(Node):
     def _publish_timer_callback(self) -> None:
         self._prune_marker_buffers()
 
-        new_estimate = self._compute_new_top_camera_table_from_window()
+        with self._freeze_lock:
+            frozen = self._table_pose_frozen
+
+        new_estimate = None
+        if not frozen:
+            new_estimate = self._compute_new_top_camera_table_from_window()
 
         if new_estimate is not None:
             smoothing_alpha = min(
@@ -980,13 +1436,21 @@ class SceneLocalizerNode(Node):
 
             self._state.last_valid_estimate = new_estimate
 
-            all_stamps = [
-                obs.stamp_sec
+            all_obs = [
+                obs
                 for observations in self._state.marker_buffers.values()
                 for obs in observations
             ]
-            if all_stamps:
-                self._state.last_valid_source_stamp_sec = max(all_stamps)
+            if all_obs:
+                src_obs = max(all_obs, key=lambda obs: obs.stamp_ns)
+                self._state.last_valid_source_stamp_sec = src_obs.stamp_sec
+                self._state.last_valid_source_stamp_ns = src_obs.stamp_ns
+
+                self._update_freeze_stability_with_sample(
+                    estimate=new_estimate,
+                    source_stamp_sec=src_obs.stamp_sec,
+                    source_stamp_ns=src_obs.stamp_ns,
+                )
 
         top_camera_table = self._state.last_valid_estimate
         if top_camera_table is None:
@@ -1353,6 +1817,150 @@ class SceneLocalizerNode(Node):
 
         if transforms:
             self._tf_broadcaster.sendTransform(transforms)
+
+    def _update_freeze_stability_with_sample(
+        self,
+        estimate: TransformEstimate,
+        source_stamp_sec: float,
+        source_stamp_ns: int,
+    ) -> None:
+        with self._freeze_lock:
+            if not self._freeze_monitoring_active:
+                return
+            if self._table_pose_frozen:
+                return
+
+            sample = StabilitySample(
+                source_stamp_ns=int(source_stamp_ns),
+                source_stamp_sec=float(source_stamp_sec),
+                translation=np.array(estimate.translation, dtype=float),
+                quaternion_xyzw=_normalize_quaternion_xyzw(np.array(estimate.quaternion_xyzw, dtype=float)),
+                estimate=TransformEstimate(
+                    translation=np.array(estimate.translation, dtype=float),
+                    quaternion_xyzw=_normalize_quaternion_xyzw(np.array(estimate.quaternion_xyzw, dtype=float)),
+                ),
+            )
+            self._freeze_debug(
+                "sample received: "
+                f"source_stamp_sec={sample.source_stamp_sec:.6f} "
+                f"source_stamp_ns={sample.source_stamp_ns} "
+                f"translation=[{sample.translation[0]:.6f}, {sample.translation[1]:.6f}, {sample.translation[2]:.6f}]"
+            )
+
+            if self._freeze_last_source_stamp_ns is not None:
+                if sample.source_stamp_ns <= self._freeze_last_source_stamp_ns:
+                    self._freeze_debug(
+                        "segment restart: non-monotonic source stamp "
+                        f"new={sample.source_stamp_ns} prev={self._freeze_last_source_stamp_ns}"
+                    )
+                    self._clear_stability_segment()
+                    self._restart_stability_segment_with(sample)
+                    self._freeze_last_source_stamp_ns = sample.source_stamp_ns
+                    return
+
+                max_gap_sec = float(self.get_parameter("freeze_max_detection_gap_sec").value)
+                dt_sec = float(sample.source_stamp_ns - self._freeze_last_source_stamp_ns) * 1e-9
+                if dt_sec > max_gap_sec:
+                    self._freeze_debug(
+                        "segment restart: source-stamp gap too large "
+                        f"dt_sec={dt_sec:.6f} max_gap_sec={max_gap_sec:.6f}"
+                    )
+                    self._clear_stability_segment()
+                    self._restart_stability_segment_with(sample)
+                    self._freeze_last_source_stamp_ns = sample.source_stamp_ns
+                    return
+
+            self._freeze_last_source_stamp_ns = sample.source_stamp_ns
+
+            self._freeze_stability_samples.append(sample)
+            max_samples = max(
+                int(self.get_parameter("freeze_min_estimates").value) * 4,
+                256,
+            )
+            if len(self._freeze_stability_samples) > max_samples:
+                self._freeze_stability_samples = self._freeze_stability_samples[-max_samples:]
+
+            stats = self._stable_segment_stats()
+            if stats is None:
+                return
+
+            duration_sec, translation_mean, quat_mean, max_trans_dev, max_rot_dev = stats
+            max_trans_allowed = float(self.get_parameter("freeze_max_translation_deviation_m").value)
+            max_rot_allowed = float(self.get_parameter("freeze_max_rotation_deviation_deg").value)
+            min_duration = float(self.get_parameter("freeze_stability_duration_sec").value)
+            min_estimates = int(self.get_parameter("freeze_min_estimates").value)
+            self._freeze_debug(
+                "segment stats: "
+                f"samples={len(self._freeze_stability_samples)} duration_sec={duration_sec:.3f} "
+                f"max_trans_dev={max_trans_dev:.6f}/{max_trans_allowed:.6f}m "
+                f"max_rot_dev={max_rot_dev:.6f}/{max_rot_allowed:.6f}deg"
+            )
+
+            if max_trans_dev > max_trans_allowed or max_rot_dev > max_rot_allowed:
+                self._freeze_debug("segment restart: translation/rotation stability threshold exceeded")
+                self._restart_stability_segment_with(sample)
+                return
+
+            if duration_sec < min_duration:
+                self._freeze_debug(
+                    "waiting for min duration: "
+                    f"duration_sec={duration_sec:.3f} < min_duration={min_duration:.3f}"
+                )
+                return
+
+            if len(self._freeze_stability_samples) < min_estimates:
+                self._freeze_debug(
+                    "waiting for min estimates: "
+                    f"samples={len(self._freeze_stability_samples)} < min_estimates={min_estimates}"
+                )
+                return
+
+            segment_start = float(self._freeze_stability_samples[0].source_stamp_sec)
+            segment_end = float(self._freeze_stability_samples[-1].source_stamp_sec)
+            if not self._freeze_required_markers_coverage_valid(
+                start_sec=segment_start,
+                end_sec=segment_end,
+            ):
+                self._freeze_debug("waiting for marker coverage requirement")
+                return
+
+            self._freeze_debug("all freeze stability checks passed; freezing table pose")
+
+            frozen_estimate = TransformEstimate(
+                translation=np.array(translation_mean, dtype=float),
+                quaternion_xyzw=_normalize_quaternion_xyzw(np.array(quat_mean, dtype=float)),
+            )
+
+            self._state.last_valid_estimate = frozen_estimate
+            self._state.last_published_estimate = frozen_estimate
+            self._state.last_valid_source_stamp_sec = sample.source_stamp_sec
+            self._state.last_valid_source_stamp_ns = sample.source_stamp_ns
+            self._table_pose_frozen = True
+            self._freeze_monitoring_active = False
+
+            stable_count = len(self._freeze_stability_samples)
+            self._clear_stability_segment()
+
+        self._publish_table_pose_frozen_status()
+        self.get_logger().info(
+            "Table pose frozen from stable ArUco segment: "
+            f"samples={stable_count} duration_sec={duration_sec:.3f} "
+            f"max_translation_dev_m={max_trans_dev:.6f} "
+            f"max_rotation_dev_deg={max_rot_dev:.6f} "
+            f"translation=[{float(frozen_estimate.translation[0]):.6f}, {float(frozen_estimate.translation[1]):.6f}, {float(frozen_estimate.translation[2]):.6f}] "
+            f"quaternion_xyzw=[{float(frozen_estimate.quaternion_xyzw[0]):.6f}, {float(frozen_estimate.quaternion_xyzw[1]):.6f}, {float(frozen_estimate.quaternion_xyzw[2]):.6f}, {float(frozen_estimate.quaternion_xyzw[3]):.6f}]"
+        )
+
+        requested = self._request_aruco_change_state_async(
+            Transition.TRANSITION_DEACTIVATE,
+            for_reacquire=False,
+        )
+        if not requested:
+            self._warn_throttled(
+                "aruco_deactivate_not_requested",
+                "Table pose frozen, but ArUco deactivation could not be requested; ArUco remains active.",
+                1.0,
+            )
 
     @staticmethod
     def _make_tf_msg(
