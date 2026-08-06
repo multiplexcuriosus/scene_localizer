@@ -13,6 +13,9 @@ def generate_launch_description():
     inhibit_scene_localizer_debug = LaunchConfiguration("inhibit_scene_localizer_debug")
     inhibit_ball_3d_pose_estimator = LaunchConfiguration("inhibit_ball_3d_pose_estimator")
     inhibit_ball_trajectory_estimator = LaunchConfiguration("inhibit_ball_trajectory_estimator")
+    enable_latency_trace = LaunchConfiguration("enable_latency_trace")
+    latency_run_id = LaunchConfiguration("latency_run_id")
+    latency_modality = LaunchConfiguration("latency_modality")
 
     scene_localizer_node = Node(
         package="scene_localizer",
@@ -37,6 +40,12 @@ def generate_launch_description():
         executable="ball_3d_pose_estimator",
         name="ball_3d_pose_estimator",
         output="screen",
+        parameters=[{
+            "enable_latency_trace": enable_latency_trace,
+            "latency_trace_topic": LaunchConfiguration("localization_latency_trace_topic"),
+            "latency_run_id": latency_run_id,
+            "latency_modality": latency_modality,
+        }],
         condition=UnlessCondition(inhibit_ball_3d_pose_estimator),
     )
 
@@ -45,7 +54,15 @@ def generate_launch_description():
         executable="ball_trajectory_estimator",
         name="ball_trajectory_estimator",
         output="screen",
-        parameters=[f"{config_dir}/ball_trajectory_estimator.yaml"],
+        parameters=[
+            f"{config_dir}/ball_trajectory_estimator.yaml",
+            {
+                "enable_latency_trace": enable_latency_trace,
+                "latency_trace_topic": LaunchConfiguration("trajectory_latency_trace_topic"),
+                "latency_run_id": latency_run_id,
+                "latency_modality": latency_modality,
+            },
+        ],
         condition=UnlessCondition(inhibit_ball_trajectory_estimator),
     )
 
@@ -70,6 +87,17 @@ def generate_launch_description():
             default_value="false",
             description="If true, do not launch the ball_trajectory_estimator node.",
         ),
+        DeclareLaunchArgument("enable_latency_trace", default_value="false"),
+        DeclareLaunchArgument(
+            "localization_latency_trace_topic",
+            default_value="/intercept_trace/localization_2d_to_3d",
+        ),
+        DeclareLaunchArgument(
+            "trajectory_latency_trace_topic",
+            default_value="/intercept_trace/trajectory_estimation",
+        ),
+        DeclareLaunchArgument("latency_run_id", default_value=""),
+        DeclareLaunchArgument("latency_modality", default_value="vision"),
         scene_localizer_node,
         scene_localizer_debug_node,
         ball_3d_pose_estimator_node,

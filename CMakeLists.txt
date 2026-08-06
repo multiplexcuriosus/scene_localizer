@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.8)
 project(scene_localizer)
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(aruco_opencv_msgs REQUIRED)
@@ -13,6 +14,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(fr3_husky_msgs REQUIRED)
+find_package(intercept_latency_monitor REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/BallTrajectory.msg"
@@ -54,6 +56,12 @@ install(
   RENAME ball_trajectory_estimator
 )
 
+install(
+  FILES
+    scene_localizer/latency_trace.py
+  DESTINATION ${PYTHON_INSTALL_DIR}/${PROJECT_NAME}
+)
+
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
@@ -65,6 +73,11 @@ install(DIRECTORY config
 install(FILES package.xml
   DESTINATION share/${PROJECT_NAME}
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_latency_trace test/test_latency_trace.py)
+endif()
 
 ament_export_dependencies(rosidl_default_runtime)
 ament_package()

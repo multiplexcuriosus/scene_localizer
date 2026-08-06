@@ -9,6 +9,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
+from scene_localizer.latency_trace import LatencyTracer
 from sensor_msgs.msg import CameraInfo
 
 
@@ -63,6 +64,19 @@ class Ball3DPoseEstimatorNode(Node):
         self.declare_parameter("reject_outside_table", False)
         self.declare_parameter("outside_table_margin", 0.05)
         self.declare_parameter("debug_log", True)
+        self.declare_parameter("enable_latency_trace", False)
+        self.declare_parameter("latency_trace_topic", "/intercept_trace/localization_2d_to_3d")
+        self.declare_parameter("latency_run_id", "")
+        self.declare_parameter("latency_modality", "vision")
+
+        self._latency_tracer = LatencyTracer(
+            self,
+            enabled=bool(self.get_parameter("enable_latency_trace").value),
+            topic=str(self.get_parameter("latency_trace_topic").value),
+            run_id=str(self.get_parameter("latency_run_id").value),
+            modality=str(self.get_parameter("latency_modality").value),
+            stage="localization_2d_to_3d",
+        )
 
         self._ball_3d_camera_pub = self.create_publisher(
             PointStamped,
@@ -113,6 +127,29 @@ class Ball3DPoseEstimatorNode(Node):
         self._cached.table_pose_time_sec = self._stamp_to_sec(msg)
 
     def _ball_px_callback(self, msg: PointStamped) -> None:
+        trace_span = self._latency_tracer.begin(msg)
+        trace_valid = False
+        trace_event = "rejected"
+        output_stamp_ns = None
+        try:
+            trace_valid = self._localize_ball_px(msg)
+            if trace_valid:
+                trace_event = "published"
+                output_stamp_ns = self.get_clock().now().nanoseconds
+        finally:
+            self._latency_tracer.finish(
+                trace_span,
+                valid=trace_valid,
+                event=trace_event,
+                detail=(
+                    {"output_ros_stamp_ns": output_stamp_ns}
+                    if output_stamp_ns is not None
+                    else None
+                ),
+                end_ros_stamp_ns=output_stamp_ns,
+            )
+
+    def _localize_ball_px(self, msg: PointStamped) -> bool:
         uv = self._extract_uv(msg)
         if uv is None:
             self._warn_throttled(
@@ -120,31 +157,39 @@ class Ball3DPoseEstimatorNode(Node):
                 "Unsupported ball pixel message format; expected PointStamped/Point-like fields",
                 2.0,
             )
-            return
+            return False
 
         camera_info = self._cached.camera_info
         if camera_info is None or self._cached.camera_info_time_sec is None:
             self._warn_throttled("camera_info_missing", "No camera_info cached yet", 1.0)
-            return
+            return False
 
         table_pose_msg = self._cached.table_pose
         if table_pose_msg is None or self._cached.table_pose_time_sec is None:
             self._warn_throttled("table_pose_missing", "No table_pose cached yet", 1.0)
-            return
+            return False
 
         ball_stamp_sec = self._stamp_to_sec(msg)
-        if self._is_stale(ball_stamp_sec, self._cached.camera_info_time_sec, float(self.get_parameter("max_camera_info_age_sec").value)):
+        if self._is_stale(
+            ball_stamp_sec,
+            self._cached.camera_info_time_sec,
+            float(self.get_parameter("max_camera_info_age_sec").value),
+        ):
             self._warn_throttled("camera_info_stale", "Cached camera_info is stale", 1.0)
-            return
+            return False
 
-        if self._is_stale(ball_stamp_sec, self._cached.table_pose_time_sec, float(self.get_parameter("max_table_pose_age_sec").value)):
+        if self._is_stale(
+            ball_stamp_sec,
+            self._cached.table_pose_time_sec,
+            float(self.get_parameter("max_table_pose_age_sec").value),
+        ):
             self._warn_throttled("table_pose_stale", "Cached table_pose is stale", 1.0)
-            return
+            return False
 
         fx, fy, cx, cy = self._extract_intrinsics(camera_info)
         if not np.isfinite(fx) or not np.isfinite(fy) or abs(fx) < 1e-12 or abs(fy) < 1e-12:
             self._warn_throttled("invalid_intrinsics", "Invalid camera intrinsics fx/fy", 1.0)
-            return
+            return False
 
         u, v = uv
         ray_cam = np.array([
@@ -155,7 +200,7 @@ class Ball3DPoseEstimatorNode(Node):
         ray_norm = float(np.linalg.norm(ray_cam))
         if not np.isfinite(ray_norm) or ray_norm < 1e-12:
             self._warn_throttled("invalid_ray", "Failed to normalize camera ray", 1.0)
-            return
+            return False
         ray_cam = ray_cam / ray_norm
 
         pose = table_pose_msg.pose
@@ -181,12 +226,12 @@ class Ball3DPoseEstimatorNode(Node):
         denom = float(np.dot(n_cam, ray_cam))
         if abs(denom) < 1e-9:
             self._warn_throttled("ray_parallel", "Ball ray is nearly parallel to table plane", 1.0)
-            return
+            return False
 
         s = float(np.dot(n_cam, p0_cam)) / denom
         if s <= 0.0 or not np.isfinite(s):
             self._warn_throttled("intersection_behind", "Ray-plane intersection is behind the camera", 1.0)
-            return
+            return False
 
         p_ball_cam = s * ray_cam
         p_ball_table = r_ct.T @ (p_ball_cam - t_ct)
@@ -194,7 +239,7 @@ class Ball3DPoseEstimatorNode(Node):
         outside_table = self._is_outside_table(p_ball_table)
         if bool(self.get_parameter("reject_outside_table").value) and outside_table:
             self._warn_throttled("outside_table", "Rejected ball estimate outside table bounds", 1.0)
-            return
+            return False
 
         camera_frame_id = str(getattr(camera_info.header, "frame_id", "")).strip()
         if not camera_frame_id:
@@ -220,6 +265,7 @@ class Ball3DPoseEstimatorNode(Node):
 
         self._ball_3d_camera_pub.publish(camera_msg)
         self._ball_3d_table_pub.publish(table_msg)
+        return True
 
         # self._log_debug(
         #     "ball_2d_px="

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import time
 from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -13,6 +14,7 @@ from geometry_msgs.msg import Point, PointStamped, Pose, PoseStamped, TransformS
 from rclpy.duration import Duration
 from rclpy.node import Node
 from scene_localizer.msg import BallTrajectory
+from scene_localizer.latency_trace import LatencyTracer, TraceSpan
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
@@ -198,6 +200,19 @@ class BallTrajectoryEstimator(Node):
         self.declare_parameter("marker_b", 0.0)
         self.declare_parameter("marker_a", 1.0)
         self.declare_parameter("debug_log", False)
+        self.declare_parameter("enable_latency_trace", False)
+        self.declare_parameter("latency_trace_topic", "/intercept_trace/trajectory_estimation")
+        self.declare_parameter("latency_run_id", "")
+        self.declare_parameter("latency_modality", "vision")
+
+        self._latency_tracer = LatencyTracer(
+            self,
+            enabled=bool(self.get_parameter("enable_latency_trace").value),
+            topic=str(self.get_parameter("latency_trace_topic").value),
+            run_id=str(self.get_parameter("latency_run_id").value),
+            modality=str(self.get_parameter("latency_modality").value),
+            stage="trajectory_estimation",
+        )
 
         input_topic = str(self.get_parameter("input_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
@@ -308,6 +323,47 @@ class BallTrajectoryEstimator(Node):
         return rclpy.time.Time(nanoseconds=total_ns).to_msg()
 
     def handle_ball_position(self, msg: PointStamped) -> None:
+        trace_span = self._latency_tracer.begin(msg)
+        fit: Optional[FitResult] = None
+        output_stamp_ns = None
+        fit_end_ros_stamp_ns = None
+        fit_end_steady_ns = None
+        rejection_reason = "observation_rejected"
+        try:
+            (
+                fit,
+                output_stamp_ns,
+                fit_end_ros_stamp_ns,
+                fit_end_steady_ns,
+            ) = self._handle_ball_position(msg, trace_span)
+            if fit is not None:
+                rejection_reason = fit.reason
+        finally:
+            detail = {
+                "reason": rejection_reason,
+                "output_published": output_stamp_ns is not None,
+            }
+            if fit is not None:
+                detail["observation_count"] = fit.num_observations
+                if np.isfinite(fit.fit_rms_error):
+                    detail["fit_rms_m"] = fit.fit_rms_error
+                if output_stamp_ns is not None:
+                    detail["output_ros_stamp_ns"] = output_stamp_ns
+            self._latency_tracer.finish(
+                trace_span,
+                valid=bool(fit is not None and fit.valid),
+                event="fit_accepted" if fit is not None and fit.valid else "fit_rejected",
+                scalar_value=(fit.fit_rms_error if fit is not None else None),
+                detail=detail,
+                end_ros_stamp_ns=fit_end_ros_stamp_ns,
+                end_steady_ns=fit_end_steady_ns,
+            )
+
+    def _handle_ball_position(
+        self,
+        msg: PointStamped,
+        trace_span: Optional[TraceSpan],
+    ) -> Tuple[Optional[FitResult], Optional[int], Optional[int], Optional[int]]:
         now_sec = self.get_clock().now().nanoseconds * 1e-9
         table_frame = str(self.get_parameter("table_frame").value)
 
@@ -318,12 +374,12 @@ class BallTrajectoryEstimator(Node):
                 f"Ignoring detection with frame_id='{frame_id}' (expected '{table_frame}')",
                 1.0,
             )
-            return
+            return None, None, None, None
 
         p = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=float)
         if not np.all(np.isfinite(p)):
             self._warn_throttled("non_finite_detection", "Ignoring detection with NaN/inf coordinates", 1.0)
-            return
+            return None, None, None, None
 
         stamp_sec, used_fallback = self._stamp_to_sec(msg)
         if used_fallback:
@@ -340,12 +396,15 @@ class BallTrajectoryEstimator(Node):
                 f"Ignoring stale detection age={now_sec - stamp_sec:.3f}s (max={max_detection_age_sec:.3f}s)",
                 1.0,
             )
-            return
+            return None, None, None, None
 
         self._buffer.append(BufferEntry(stamp_sec=stamp_sec, position=p))
         self.prune_buffer(now_sec)
 
+        self._latency_tracer.mark_start(trace_span)
         fit = self.fit_trajectory(now_sec)
+        fit_end_steady_ns = time.monotonic_ns()
+        fit_end_ros_stamp_ns = self.get_clock().now().nanoseconds
         if not fit.valid:
             provisional_reasons = {
                 "refining_observation_count",
@@ -362,8 +421,12 @@ class BallTrajectoryEstimator(Node):
 
         if fit.valid or bool(self.get_parameter("publish_invalid_trajectory").value):
             self.publish_trajectory(fit)
+            output_stamp_ns = self.get_clock().now().nanoseconds
+        else:
+            output_stamp_ns = None
 
         self.publish_marker(fit)
+        return fit, output_stamp_ns, fit_end_ros_stamp_ns, fit_end_steady_ns
 
     def prune_buffer(self, now_sec: Optional[float] = None) -> None:
         if now_sec is None:

@@ -35,3 +35,8 @@ ball_trajectory_estimator:
     marker_a: 1.0
 
     debug_log: true
+
+    enable_latency_trace: false
+    latency_trace_topic: "/intercept_trace/trajectory_estimation"
+    latency_run_id: ""
+    latency_modality: "vision"
