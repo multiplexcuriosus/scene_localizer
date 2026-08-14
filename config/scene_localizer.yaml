@@ -2,6 +2,7 @@ scene_localizer:
   ros__parameters:
     marker_layout_yaml: "/home/jau/dyros/src/scene_localizer/config/table_marker_layout.yaml"
     base_cam_calibration_yaml: "/home/jau/dyros/calibration/scene_localizer/T_base_cam.yaml"
+    frozen_table_pose_yaml: "/home/jau/dyros/calibration/scene_localizer/T_top_camera_table_frozen.yaml"
 
     robot_base_frame: "base"
     calibration_link_frame: "fr3_link6"

@@ -272,6 +272,10 @@ class SceneLocalizerNode(Node):
 
         self.declare_parameter("marker_layout_yaml", str(default_marker_yaml))
         self.declare_parameter("base_cam_calibration_yaml", "/home/jau/dyros/calibration/scene_localizer/T_base_cam.yaml")
+        self.declare_parameter(
+            "frozen_table_pose_yaml",
+            "/home/jau/dyros/calibration/scene_localizer/T_top_camera_table_frozen.yaml",
+        )
 
         self.declare_parameter("robot_base_frame", "base")
         self.declare_parameter("calibration_link_frame", "fr3_link6")
@@ -374,6 +378,10 @@ class SceneLocalizerNode(Node):
         self._freeze_stability_samples: List[StabilitySample] = []
         self._freeze_monitoring_active = False
         self._table_pose_frozen = False
+        self._frozen_table_pose_yaml = Path(
+            str(self.get_parameter("frozen_table_pose_yaml").value)
+        )
+        self._loaded_pose_needs_aruco_deactivation = False
         self._freeze_last_source_stamp_ns: Optional[int] = None
         self._lifecycle_transition_pending = False
         self._pending_lifecycle_transition_id: Optional[int] = None
@@ -383,6 +391,7 @@ class SceneLocalizerNode(Node):
             ChangeState,
             str(self.get_parameter("aruco_change_state_service").value),
         )
+        self._load_frozen_table_pose()
 
         valid_modes = {"marker_pose_average", "marker_center_alignment"}
         global_mode = str(self.get_parameter("estimation_mode").value)
@@ -464,6 +473,9 @@ class SceneLocalizerNode(Node):
 
         publish_rate_hz = max(0.1, float(self.get_parameter("publish_rate_hz").value))
         self._publish_timer = self.create_timer(1.0 / publish_rate_hz, self._publish_timer_callback)
+        self._loaded_pose_deactivation_timer = self.create_timer(
+            1.0, self._deactivate_aruco_for_loaded_pose
+        )
 
         self._publish_table_pose_frozen_status()
 
@@ -539,6 +551,100 @@ class SceneLocalizerNode(Node):
         msg = Bool()
         msg.data = bool(self._table_pose_frozen)
         self._table_pose_frozen_pub.publish(msg)
+
+    def _load_frozen_table_pose(self) -> bool:
+        """Restore the last explicitly frozen T_top_camera_table pose."""
+        path = self._frozen_table_pose_yaml
+        try:
+            with path.open("r", encoding="utf-8") as yaml_file:
+                data = yaml.safe_load(yaml_file)
+            if not isinstance(data, dict):
+                raise ValueError("YAML root must be a mapping")
+            parent_frame = _clean_frame(data["parent_frame"])
+            child_frame = _clean_frame(data["child_frame"])
+            if parent_frame != self._top_camera_frame or child_frame != self._table_frame:
+                raise ValueError(
+                    f"frame mismatch: file has {parent_frame}->{child_frame}, expected "
+                    f"{self._top_camera_frame}->{self._table_frame}"
+                )
+            translation_data = data["translation"]
+            quaternion_data = data["quaternion_xyzw"]
+            translation = np.array(
+                [float(translation_data[key]) for key in ("x", "y", "z")],
+                dtype=float,
+            )
+            quaternion = np.array(
+                [float(quaternion_data[key]) for key in ("x", "y", "z", "w")],
+                dtype=float,
+            )
+            if not np.all(np.isfinite(translation)):
+                raise ValueError("translation contains non-finite values")
+            if not np.all(np.isfinite(quaternion)) or float(np.linalg.norm(quaternion)) < 1e-12:
+                raise ValueError("quaternion is invalid")
+            estimate = TransformEstimate(
+                translation=translation,
+                quaternion_xyzw=_normalize_quaternion_xyzw(quaternion),
+            )
+        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+            self.get_logger().error(
+                "ARUCO LOCALIZATION POSE NOT AVAILABLE: failed to load frozen table "
+                f"pose from '{path}': {exc}. ArUco reacquisition will remain active; "
+                "freeze the pose from the dashboard once a valid pose is acquired."
+            )
+            return False
+
+        self._state.last_valid_estimate = estimate
+        self._state.last_published_estimate = estimate
+        self._table_pose_frozen = True
+        self._loaded_pose_needs_aruco_deactivation = True
+        self.get_logger().info(
+            f"Loaded frozen ArUco table pose from '{path}'; localization starts frozen."
+        )
+        return True
+
+    def _save_frozen_table_pose(self, estimate: TransformEstimate) -> Optional[str]:
+        path = self._frozen_table_pose_yaml
+        quaternion = _normalize_quaternion_xyzw(
+            np.asarray(estimate.quaternion_xyzw, dtype=float)
+        )
+        translation = np.asarray(estimate.translation, dtype=float)
+        data = {
+            "parent_frame": self._top_camera_frame,
+            "child_frame": self._table_frame,
+            "translation": {
+                "x": float(translation[0]),
+                "y": float(translation[1]),
+                "z": float(translation[2]),
+            },
+            "quaternion_xyzw": {
+                "x": float(quaternion[0]),
+                "y": float(quaternion[1]),
+                "z": float(quaternion[2]),
+                "w": float(quaternion[3]),
+            },
+        }
+        temporary_path = path.with_name(f"{path.name}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with temporary_path.open("w", encoding="utf-8") as yaml_file:
+                yaml.safe_dump(data, yaml_file, sort_keys=False)
+                yaml_file.flush()
+            temporary_path.replace(path)
+        except (OSError, yaml.YAMLError) as exc:
+            error = f"failed to save frozen table pose to '{path}': {exc}"
+            self.get_logger().error(f"ARUCO LOCALIZATION POSE SAVE FAILED: {error}")
+            return error
+        self.get_logger().info(f"Saved frozen ArUco table pose to '{path}'.")
+        return None
+
+    def _deactivate_aruco_for_loaded_pose(self) -> None:
+        if not self._loaded_pose_needs_aruco_deactivation:
+            return
+        if self._request_aruco_change_state_async(
+            Transition.TRANSITION_DEACTIVATE,
+            for_reacquire=False,
+        ):
+            self._loaded_pose_needs_aruco_deactivation = False
 
     def _freeze_required_marker_ids(self) -> List[int]:
         configured = list(self.get_parameter("freeze_required_marker_ids").value)
@@ -737,6 +843,7 @@ class SceneLocalizerNode(Node):
                     1.0,
                 )
             else:
+                self._loaded_pose_needs_aruco_deactivation = True
                 self._warn_throttled(
                     "aruco_deactivate_exception",
                     f"Table pose frozen, but ArUco deactivation request failed: {exc}.",
@@ -764,6 +871,7 @@ class SceneLocalizerNode(Node):
             return
 
         if not success:
+            self._loaded_pose_needs_aruco_deactivation = True
             self._warn_throttled(
                 "aruco_deactivate_failed",
                 "Table pose frozen, but ArUco lifecycle deactivation failed; ArUco remains active.",
@@ -800,6 +908,11 @@ class SceneLocalizerNode(Node):
                         np.array(latest_estimate.quaternion_xyzw, dtype=float)
                     ),
                 )
+                save_error = self._save_frozen_table_pose(frozen_estimate)
+                if save_error is not None:
+                    response.success = False
+                    response.message = f"Cannot freeze table pose: {save_error}"
+                    return response
                 self._state.last_valid_estimate = frozen_estimate
                 self._state.last_published_estimate = frozen_estimate
                 self._table_pose_frozen = True
@@ -809,7 +922,10 @@ class SceneLocalizerNode(Node):
                 publish_frozen_status = True
                 retry_deactivate = not self._lifecycle_transition_pending
                 response.success = True
-                response.message = "Table pose frozen immediately (freeze_skip_checks=true)."
+                response.message = (
+                    "Table pose saved and frozen immediately "
+                    "(freeze_skip_checks=true)."
+                )
             elif self._freeze_monitoring_active:
                 response.success = True
                 response.message = "Table-pose stability monitoring is already active."
@@ -825,10 +941,11 @@ class SceneLocalizerNode(Node):
             self._publish_table_pose_frozen_status()
 
         if retry_deactivate:
-            self._request_aruco_change_state_async(
+            requested = self._request_aruco_change_state_async(
                 Transition.TRANSITION_DEACTIVATE,
                 for_reacquire=False,
             )
+            self._loaded_pose_needs_aruco_deactivation = not requested
             return response
 
         if publish_frozen_status:
@@ -843,6 +960,7 @@ class SceneLocalizerNode(Node):
 
     def _handle_reacquire_table_pose(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
+        self._loaded_pose_needs_aruco_deactivation = False
         with self._freeze_lock:
             if self._lifecycle_transition_pending:
                 response.success = True
@@ -1931,6 +2049,16 @@ class SceneLocalizerNode(Node):
                 quaternion_xyzw=_normalize_quaternion_xyzw(np.array(quat_mean, dtype=float)),
             )
 
+            save_error = self._save_frozen_table_pose(frozen_estimate)
+            if save_error is not None:
+                self._freeze_monitoring_active = False
+                self._clear_stability_segment()
+                self.get_logger().error(
+                    "Table pose was not frozen because it could not be persisted; "
+                    "ArUco localization remains active."
+                )
+                return
+
             self._state.last_valid_estimate = frozen_estimate
             self._state.last_published_estimate = frozen_estimate
             self._state.last_valid_source_stamp_sec = sample.source_stamp_sec
@@ -1955,6 +2083,7 @@ class SceneLocalizerNode(Node):
             Transition.TRANSITION_DEACTIVATE,
             for_reacquire=False,
         )
+        self._loaded_pose_needs_aruco_deactivation = not requested
         if not requested:
             self._warn_throttled(
                 "aruco_deactivate_not_requested",
