@@ -73,6 +73,71 @@ a `T_base_cam` calibration) is rejected rather than reinterpreted. Camera YAML
 may use ROS `camera_matrix`/`distortion_coefficients` mappings or simple `K`/`D`
 arrays.
 
+## Native event-camera ball localization
+
+`event_ball_pipeline.launch.py` replaces only the RGB 2D-to-3D front end. It
+starts one calibration adapter, one `ball_3d_pose_estimator`, and one unchanged
+`ball_trajectory_estimator`:
+
+```text
+/openmv_cam/event_tracker/ball_2d_px
+  -> /scene_localizer/event/ball_3d_table
+  -> /scene/ball_trajectory_table
+```
+
+The event pixels are the raw native GENX320 coordinates: 320x320, top-left
+origin, x right, y down. They are not rotated, mirrored, resized, cropped, or
+otherwise reinterpreted. `event_ball_pipeline.yaml` sets
+`input_pixels_are_rectified: false`, so the estimator applies
+`cv2.undistortPoints()` exactly once using the adapter's raw K and D. The RGB
+default remains `input_pixels_are_rectified: true`, preserving its legacy
+direct-pinhole behavior for an already-rectified RGB detector/CameraInfo pair.
+Do not set the parameter to false for pixels that were already rectified.
+
+The adapter loads the solved event calibration YAML directly. It consumes the
+serializer's top-level `camera_matrix`, `distortion_coefficients`,
+`distortion_model`, `image_width`, `image_height`, and `T_table_camera` blocks.
+The convention is `T_parent_child`: `T_table_camera` maps event-camera
+coordinates into the calibrated table coordinates. The published
+`PoseStamped` is computed as `T_camera_table = inverse(T_table_camera)`, has
+`header.frame_id=event_camera` by default, and describes the table in that
+camera frame. The adapter publishes:
+
+- `/event_camera/camera_info`
+- `/scene_localizer/event_camera/table_pose_camera`
+
+The 2D-to-3D estimator publishes:
+
+- `/scene_localizer/event/ball_3d_camera` in `event_camera`
+- `/scene_localizer/event/ball_3d_table` in `table_frame`
+
+The table output is a ball-center `geometry_msgs/PointStamped` on
+`z_table=ball_radius`, retaining the incoming event detection timestamp. The
+trajectory fit, middle-line intersection, `/scene/ball_trajectory_table`, and
+the downstream GOTO_S/TRACK_S interfaces are unchanged.
+
+Launch the event branch with the solved YAML:
+
+```bash
+ros2 launch scene_localizer event_ball_pipeline.launch.py \
+  calibration_file:="$HOME/.ros/event_camera_calibration/genx320_calibration.yaml"
+```
+
+If `all_scene_localizer_nodes.launch.py` is used to supply the table-to-base
+pose, TCP TF, and robot-base conversion, inhibit its RGB ball nodes so there is
+only one trajectory publisher:
+
+```bash
+ros2 launch scene_localizer all_scene_localizer_nodes.launch.py \
+  inhibit_ball_3d_pose_estimator:=true \
+  inhibit_ball_trajectory_estimator:=true
+```
+
+The adapter defaults to requiring 320x320 calibration dimensions and rejects a
+mismatch rather than scaling coordinates. Set `expected_image_width` or
+`expected_image_height` to a non-positive value only to disable that explicit
+check for a deliberately different native sensor.
+
 ## Raw latency tracing
 
 The 2D-to-3D and trajectory nodes can publish raw

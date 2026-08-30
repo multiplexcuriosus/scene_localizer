@@ -1,0 +1,32 @@
+event_camera_calibration_adapter:
+  ros__parameters:
+    calibration_file: "~/.ros/event_camera_calibration/genx320_calibration.yaml"
+    camera_info_topic: "/event_camera/camera_info"
+    table_pose_topic: "/scene_localizer/event_camera/table_pose_camera"
+    event_camera_frame: "event_camera"
+    table_frame: "table_frame"
+    publish_rate_hz: 10.0
+    expected_image_width: 320
+    expected_image_height: 320
+
+ball_3d_pose_estimator:
+  ros__parameters:
+    ball_px_topic: "/openmv_cam/event_tracker/ball_2d_px"
+    camera_info_topic: "/event_camera/camera_info"
+    table_pose_topic: "/scene_localizer/event_camera/table_pose_camera"
+    ball_3d_camera_topic: "/scene_localizer/event/ball_3d_camera"
+    ball_3d_table_topic: "/scene_localizer/event/ball_3d_table"
+    table_frame: "table_frame"
+    ball_radius: 0.035
+    table_shortedge: 0.6
+    table_longedge: 1.2
+    reject_outside_table: false
+    # Event tracker pixels and calibration are the same raw, native 320x320
+    # coordinates. This enables one cv2.undistortPoints() call in the estimator.
+    input_pixels_are_rectified: false
+    latency_modality: "event"
+
+ball_trajectory_estimator:
+  ros__parameters:
+    input_topic: "/scene_localizer/event/ball_3d_table"
+    latency_modality: "event"

@@ -11,7 +11,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml', 'README.md']),
-        ('share/' + package_name + '/config', ['config/table_marker_layout.yaml']),
+        ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
@@ -30,6 +30,8 @@ setup(
             'scene_localizer = scene_localizer.scene_localizer_node:main',
             'scene_localizer_debug = scene_localizer.scene_localizer_debug_node:main',
             'ball_3d_pose_estimator = scene_localizer.ball_3d_pose_estimator_node:main',
+            'event_camera_calibration_adapter = '
+            'scene_localizer.event_camera_calibration_adapter_node:main',
             'ball_trajectory_estimator = scene_localizer.ball_trajectory_estimator:main',
         ],
     },

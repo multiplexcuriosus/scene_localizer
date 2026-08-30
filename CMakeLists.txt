@@ -51,6 +51,13 @@ install(
 
 install(
   PROGRAMS
+    scene_localizer/event_camera_calibration_adapter_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME event_camera_calibration_adapter
+)
+
+install(
+  PROGRAMS
     scene_localizer/ball_trajectory_estimator.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME ball_trajectory_estimator
@@ -58,12 +65,15 @@ install(
 
 install(
   FILES
+    scene_localizer/event_ball_geometry.py
+    scene_localizer/event_camera_calibration_adapter_node.py
     scene_localizer/latency_trace.py
   DESTINATION ${PYTHON_INSTALL_DIR}/${PROJECT_NAME}
 )
 
 install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
 )
 
 install(DIRECTORY config
@@ -77,6 +87,10 @@ install(FILES package.xml
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_latency_trace test/test_latency_trace.py)
+  ament_add_pytest_test(
+    test_event_ball_pipeline
+    test/test_event_ball_pipeline.py
+  )
 endif()
 
 ament_export_dependencies(rosidl_default_runtime)

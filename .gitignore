@@ -1,3 +1,4 @@
 test/*
 !test/test_latency_trace.py
+!test/test_event_ball_pipeline.py
 *.pyc

@@ -25,6 +25,8 @@
   <depend>fr3_husky_msgs</depend>
   <depend>intercept_latency_monitor</depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
 
   <member_of_group>rosidl_interface_packages</member_of_group>

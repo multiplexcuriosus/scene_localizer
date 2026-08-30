@@ -9,6 +9,12 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
+from scene_localizer.event_ball_geometry import (
+    BallLocalizationError,
+    camera_ray_from_pixel,
+    intersect_camera_ray_with_ball_plane,
+    make_ball_point_messages,
+)
 from scene_localizer.latency_trace import LatencyTracer
 from sensor_msgs.msg import CameraInfo
 
@@ -59,6 +65,10 @@ class Ball3DPoseEstimatorNode(Node):
         self.declare_parameter("ball_radius", 0.0325)
         self.declare_parameter("table_shortedge", 0.6)
         self.declare_parameter("table_longedge", 1.2)
+        # The RGB default preserves the legacy direct-pinhole behavior. Set
+        # false only when the supplied pixels are raw and CameraInfo K/D
+        # describe those same raw coordinates (as in event_ball_pipeline.yaml).
+        self.declare_parameter("input_pixels_are_rectified", True)
         self.declare_parameter("max_table_pose_age_sec", 1.0)
         self.declare_parameter("max_camera_info_age_sec", 5.0)
         self.declare_parameter("reject_outside_table", False)
@@ -115,7 +125,9 @@ class Ball3DPoseEstimatorNode(Node):
             f"camera_info={self.get_parameter('camera_info_topic').value}, "
             f"table_pose={self.get_parameter('table_pose_topic').value}, "
             f"ball_3d_camera={self.get_parameter('ball_3d_camera_topic').value}, "
-            f"ball_3d_table={self.get_parameter('ball_3d_table_topic').value}"
+            f"ball_3d_table={self.get_parameter('ball_3d_table_topic').value}, "
+            "pixels_are_rectified="
+            f"{self.get_parameter('input_pixels_are_rectified').value}"
         )
 
     def _camera_info_callback(self, msg: CameraInfo) -> None:
@@ -186,22 +198,26 @@ class Ball3DPoseEstimatorNode(Node):
             self._warn_throttled("table_pose_stale", "Cached table_pose is stale", 1.0)
             return False
 
-        fx, fy, cx, cy = self._extract_intrinsics(camera_info)
-        if not np.isfinite(fx) or not np.isfinite(fy) or abs(fx) < 1e-12 or abs(fy) < 1e-12:
-            self._warn_throttled("invalid_intrinsics", "Invalid camera intrinsics fx/fy", 1.0)
-            return False
-
         u, v = uv
-        ray_cam = np.array([
-            (u - cx) / fx,
-            (v - cy) / fy,
-            1.0,
-        ], dtype=float)
-        ray_norm = float(np.linalg.norm(ray_cam))
-        if not np.isfinite(ray_norm) or ray_norm < 1e-12:
-            self._warn_throttled("invalid_ray", "Failed to normalize camera ray", 1.0)
+        try:
+            camera_matrix = np.asarray(camera_info.k, dtype=np.float64).reshape(3, 3)
+            ray_cam = camera_ray_from_pixel(
+                u,
+                v,
+                camera_matrix,
+                np.asarray(camera_info.d, dtype=np.float64),
+                pixels_are_rectified=bool(
+                    self.get_parameter("input_pixels_are_rectified").value
+                ),
+                distortion_model=str(camera_info.distortion_model),
+            )
+        except (BallLocalizationError, TypeError, ValueError) as error:
+            self._warn_throttled(
+                "invalid_calibrated_ray",
+                f"Failed to construct calibrated camera ray: {error}",
+                1.0,
+            )
             return False
-        ray_cam = ray_cam / ray_norm
 
         pose = table_pose_msg.pose
         t_ct = np.array(
@@ -220,25 +236,30 @@ class Ball3DPoseEstimatorNode(Node):
         r_ct = _quaternion_to_matrix_xyzw(q_ct)
 
         ball_radius = max(0.0, float(self.get_parameter("ball_radius").value))
-        p0_cam = r_ct @ np.array([0.0, 0.0, ball_radius], dtype=float) + t_ct
-        n_cam = r_ct @ np.array([0.0, 0.0, 1.0], dtype=float)
-
-        denom = float(np.dot(n_cam, ray_cam))
-        if abs(denom) < 1e-9:
-            self._warn_throttled("ray_parallel", "Ball ray is nearly parallel to table plane", 1.0)
+        T_camera_table = np.eye(4, dtype=np.float64)
+        T_camera_table[:3, :3] = r_ct
+        T_camera_table[:3, 3] = t_ct
+        try:
+            p_ball_cam, p_ball_table = intersect_camera_ray_with_ball_plane(
+                ray_cam,
+                T_camera_table,
+                ball_radius,
+            )
+        except BallLocalizationError as error:
+            self._warn_throttled(
+                "invalid_ray_plane_intersection",
+                f"Failed to intersect ball ray with table plane: {error}",
+                1.0,
+            )
             return False
-
-        s = float(np.dot(n_cam, p0_cam)) / denom
-        if s <= 0.0 or not np.isfinite(s):
-            self._warn_throttled("intersection_behind", "Ray-plane intersection is behind the camera", 1.0)
-            return False
-
-        p_ball_cam = s * ray_cam
-        p_ball_table = r_ct.T @ (p_ball_cam - t_ct)
 
         outside_table = self._is_outside_table(p_ball_table)
         if bool(self.get_parameter("reject_outside_table").value) and outside_table:
-            self._warn_throttled("outside_table", "Rejected ball estimate outside table bounds", 1.0)
+            self._warn_throttled(
+                "outside_table",
+                "Rejected ball estimate outside table bounds",
+                1.0,
+            )
             return False
 
         camera_frame_id = str(getattr(camera_info.header, "frame_id", "")).strip()
@@ -248,20 +269,13 @@ class Ball3DPoseEstimatorNode(Node):
         table_frame_id = str(self.get_parameter("table_frame").value)
 
         ball_stamp_msg = self._stamp_msg(msg)
-
-        camera_msg = PointStamped()
-        camera_msg.header.stamp = ball_stamp_msg
-        camera_msg.header.frame_id = camera_frame_id
-        camera_msg.point.x = float(p_ball_cam[0])
-        camera_msg.point.y = float(p_ball_cam[1])
-        camera_msg.point.z = float(p_ball_cam[2])
-
-        table_msg = PointStamped()
-        table_msg.header.stamp = camera_msg.header.stamp
-        table_msg.header.frame_id = table_frame_id
-        table_msg.point.x = float(p_ball_table[0])
-        table_msg.point.y = float(p_ball_table[1])
-        table_msg.point.z = float(p_ball_table[2])
+        camera_msg, table_msg = make_ball_point_messages(
+            p_ball_cam,
+            p_ball_table,
+            ball_stamp_msg,
+            camera_frame_id,
+            table_frame_id,
+        )
 
         self._ball_3d_camera_pub.publish(camera_msg)
         self._ball_3d_table_pub.publish(table_msg)
@@ -271,7 +285,9 @@ class Ball3DPoseEstimatorNode(Node):
         #     "ball_2d_px="
         #     f"({u:.3f}, {v:.3f}), "
         #     f"ball_3d_camera=({p_ball_cam[0]:.4f}, {p_ball_cam[1]:.4f}, {p_ball_cam[2]:.4f}), "
-        #     f"ball_3d_table=({p_ball_table[0]:.4f}, {p_ball_table[1]:.4f}, {p_ball_table[2]:.4f}), "
+        #     "ball_3d_table="
+        #     f"({p_ball_table[0]:.4f}, {p_ball_table[1]:.4f}, "
+        #     f"{p_ball_table[2]:.4f}), "
         #     f"outside_table={outside_table}"
         # )
 
