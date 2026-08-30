@@ -17,7 +17,6 @@ from geometry_msgs.msg import PointStamped, Pose, PoseStamped, TransformStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from fr3_husky_msgs.msg import MiddleLine
 from scene_localizer.msg import BallTrajectory
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -186,7 +185,7 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("table_edge_z", 0.0)
         self.declare_parameter("table_pose_timeout_sec", 1.0)
         self.declare_parameter("robot_base_table_pose_timeout_sec", 1.0)
-        self.declare_parameter("draw_table_rectangle", True)
+        self.declare_parameter("draw_table_rectangle", False)
 
         self.declare_parameter("trajectory_timeout_sec", 0.5)
         self.declare_parameter("draw_trajectory_debug_text", True)
@@ -194,23 +193,11 @@ class SceneLocalizerDebugNode(Node):
         self.declare_parameter("trajectory_start_radius_px", 5)
         self.declare_parameter("trajectory_end_radius_px", 7)
 
-        # Authoritative captured middle-line state published by
-        # trajectory_executor (white-eth). Transient-local so a debug node
-        # started after capture still receives the latest state immediately.
-        self.declare_parameter(
-            "middle_line_state_topic",
-            "/trajectory_executor/middle_line_state",
-        )
-
         self.declare_parameter("draw_tcp_middle_line", True)
-        # Obsolete for the captured middle-line overlay: geometry now comes
-        # entirely from the cached MiddleLine message (center/direction/
-        # half_length). Retained only for launch-file compatibility; not read
-        # by _draw_captured_middle_line_overlay().
         self.declare_parameter("ball_radius", 0.0325)
-        self.declare_parameter("tcp_middle_line_length", 0.3)
-        self.declare_parameter("tcp_middle_line_half_length", 0.3)
-        self.declare_parameter("tcp_middle_line_thickness", 3)
+        self.declare_parameter("tcp_middle_line_half_length", 0.15)
+        self.declare_parameter("tcp_middle_line_z_offset", -0.02)
+        self.declare_parameter("tcp_middle_line_thickness", 5)
         self.declare_parameter("draw_trajectory_extrapolation", True)
         self.declare_parameter("trajectory_intersection_mode", "tcp_xz_plane")
         self.declare_parameter("allow_backward_trajectory_intersection", False)
@@ -224,12 +211,6 @@ class SceneLocalizerDebugNode(Node):
         self._latest_robot_base_table_pose_time_sec: Optional[float] = None
         self._latest_ball_2d_px: Optional[PointStamped] = None
         self._latest_ball_2d_px_time_sec: Optional[float] = None
-
-        # Authoritative captured middle-line state (persistent scene state).
-        # No freshness timeout is applied: once a valid state is received it
-        # remains displayed until a newer valid state replaces it.
-        self._latest_middle_line: Optional[MiddleLine] = None
-        self._latest_middle_line_revision: Optional[int] = None
 
         self._top = TopCameraState(
             name="top_cam",
@@ -295,23 +276,6 @@ class SceneLocalizerDebugNode(Node):
             10,
         )
 
-        # The captured middle-line state is published reliable/transient-local
-        # by trajectory_executor so a late-joining debug node still receives
-        # the most recent sample. Do not reuse image_qos (best-effort/volatile)
-        # for this state topic.
-        middle_line_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
-        self.create_subscription(
-            MiddleLine,
-            str(self.get_parameter("middle_line_state_topic").value),
-            self._middle_line_state_callback,
-            middle_line_qos,
-        )
-
         render_rate_hz = max(0.1, float(self.get_parameter("debug_render_rate_hz").value))
         self._debug_render_timer = self.create_timer(1.0 / render_rate_hz, self._render_latest_debug_image)
 
@@ -330,13 +294,7 @@ class SceneLocalizerDebugNode(Node):
             f"table_frame={str(self.get_parameter('table_frame').value)}, "
             f"tcp_frame={str(self.get_parameter('tcp_frame').value)}"
         )
-        self.get_logger().info(
-            "Middle-line overlay source:\n"
-            f"  topic={str(self.get_parameter('middle_line_state_topic').value)}\n"
-            "  QoS=reliable/transient_local\n"
-            "  geometry=center + direction + half_length\n"
-            "  live TCP following disabled"
-        )
+        self.get_logger().info("Middle-line overlay follows the current TCP (half-length 0.15 m by default)")
 
     def _warn_throttled(self, key: str, message: str, throttle_sec: float = 1.0) -> None:
         now_ns = self.get_clock().now().nanoseconds
@@ -387,102 +345,6 @@ class SceneLocalizerDebugNode(Node):
         self._latest_ball_2d_px = msg
         self._latest_ball_2d_px_time_sec = self._stamp_to_sec(msg)
 
-    def _middle_line_state_callback(self, msg: MiddleLine) -> None:
-        """Cache the latest valid captured middle-line state.
-
-        No freshness timeout is applied here: the cached state remains the
-        authoritative pink-line geometry until a newer valid message with a
-        higher (or equal) revision replaces it. An invalid message never
-        clears a previously cached valid state.
-        """
-        if not bool(msg.valid):
-            self._debug_throttled(
-                "middle_line_invalid_msg",
-                "Ignoring middle-line state: valid=False",
-                2.0,
-            )
-            return
-
-        center = np.array(
-            [float(msg.center.x), float(msg.center.y), float(msg.center.z)],
-            dtype=float,
-        )
-        if not _is_finite_vector(center):
-            self._warn_throttled(
-                "middle_line_center_non_finite",
-                "Ignoring middle-line state: center contains non-finite values",
-                2.0,
-            )
-            return
-
-        direction = np.array(
-            [float(msg.direction.x), float(msg.direction.y), float(msg.direction.z)],
-            dtype=float,
-        )
-        if not _is_finite_vector(direction):
-            self._warn_throttled(
-                "middle_line_direction_non_finite",
-                "Ignoring middle-line state: direction contains non-finite values",
-                2.0,
-            )
-            return
-
-        direction_norm = float(np.linalg.norm(direction))
-        if direction_norm <= 1e-9:
-            self._warn_throttled(
-                "middle_line_direction_degenerate",
-                "Ignoring middle-line state: direction norm is too small",
-                2.0,
-            )
-            return
-
-        half_length = float(msg.half_length)
-        if not np.isfinite(half_length) or half_length <= 0.0:
-            self._warn_throttled(
-                "middle_line_half_length_invalid",
-                f"Ignoring middle-line state: half_length={half_length} is not finite/positive",
-                2.0,
-            )
-            return
-
-        incoming_revision = int(msg.revision)
-
-        if (
-            self._latest_middle_line_revision is not None
-            and incoming_revision < self._latest_middle_line_revision
-        ):
-            self._warn_throttled(
-                "middle_line_old_revision",
-                (
-                    f"Ignoring older middle-line revision {incoming_revision}; "
-                    f"current revision is {self._latest_middle_line_revision}"
-                ),
-                2.0,
-            )
-            return
-
-        if (
-            self._latest_middle_line_revision is not None
-            and incoming_revision == self._latest_middle_line_revision
-        ):
-            # Same revision re-delivered (e.g. transient-local replay on a
-            # fresh subscription match): refresh the cached message without
-            # repeatedly logging it.
-            self._latest_middle_line = msg
-            return
-
-        self._latest_middle_line = msg
-        self._latest_middle_line_revision = incoming_revision
-
-        self.get_logger().info(
-            f"Updated captured middle line: revision={incoming_revision}, "
-            f"frame={msg.header.frame_id}, "
-            f"center=({msg.center.x:.4f}, {msg.center.y:.4f}, {msg.center.z:.4f}), "
-            f"direction=({msg.direction.x:.4f}, {msg.direction.y:.4f}, {msg.direction.z:.4f}), "
-            f"half_length={msg.half_length:.4f}, "
-            f"ee={msg.ee_name}"
-        )
-
     def _detections_callback(self, msg: ArucoDetection) -> None:
         self._top.latest_detections = msg
         self._top.latest_detection_time_sec = self._stamp_to_sec(msg)
@@ -530,7 +392,7 @@ class SceneLocalizerDebugNode(Node):
         # Report a fixed order so timing lines are stable across reports.
         ordered_steps = [
             "convert",
-            "prepare_vga",
+            "prepare_debug",
             "intrinsics",
             "proj_text",
             "transforms",
@@ -591,8 +453,9 @@ class SceneLocalizerDebugNode(Node):
 
         source_height, source_width = frame_native.shape[:2]
         t0 = time.perf_counter()
-        frame_vga, scale, pad_x, pad_y = self._prepare_vga_frame(frame_native)
-        self._perf_record_step_ms("prepare_vga", (time.perf_counter() - t0) * 1000.0)
+        frame_debug, scale, pad_x, pad_y = self._prepare_debug_frame(frame_native)
+        self._perf_record_step_ms("prepare_debug", (time.perf_counter() - t0) * 1000.0)
+        output_height, output_width = frame_debug.shape[:2]
 
         K_vga = None
         t0 = time.perf_counter()
@@ -608,7 +471,7 @@ class SceneLocalizerDebugNode(Node):
         self._begin_frame_text()
         t0 = time.perf_counter()
         self._draw_projection_debug_text(
-            frame=frame_vga,
+            frame=frame_debug,
             image_msg=image_msg,
             source_width=source_width,
             source_height=source_height,
@@ -623,7 +486,7 @@ class SceneLocalizerDebugNode(Node):
         self._perf_record_step_ms("transforms", (time.perf_counter() - t0) * 1000.0)
 
         if K_vga is None:
-            self._draw_status_text(frame_vga, "no valid camera_info/K", (0, 140, 255))
+            self._draw_status_text(frame_debug, "no valid camera_info/K", (0, 140, 255))
         else:
             detection_timeout_sec = max(0.0, float(self.get_parameter("detection_timeout_sec").value))
             detections_stale = (
@@ -633,38 +496,38 @@ class SceneLocalizerDebugNode(Node):
 
             t0 = time.perf_counter()
             if detections_stale:
-                self._draw_status_text(frame_vga, "detections stale", (0, 140, 255))
+                self._draw_status_text(frame_debug, "detections stale", (0, 140, 255))
             elif self._top.latest_detections is None:
-                self._draw_status_text(frame_vga, "no detections", (0, 140, 255))
+                self._draw_status_text(frame_debug, "no detections", (0, 140, 255))
             else:
                 physical_marker_size = max(1e-6, float(self.get_parameter("physical_marker_size").value))
                 axis_length = max(1e-6, float(self.get_parameter("axis_length").value))
                 self._draw_detection_overlay(
-                    frame=frame_vga,
+                    frame=frame_debug,
                     detections_msg=self._top.latest_detections,
                     physical_marker_size=physical_marker_size,
                     axis_length=axis_length,
                     K=K_vga,
                     D=self._camera_D,
-                    image_width=640,
-                    image_height=480,
+                    image_width=output_width,
+                    image_height=output_height,
                 )
             self._perf_record_step_ms("detection", (time.perf_counter() - t0) * 1000.0)
 
             t0 = time.perf_counter()
             self._draw_table_rectangle_overlay(
-                frame=frame_vga,
+                frame=frame_debug,
                 T_cam_table=transforms.get("T_cam_table"),
                 K=K_vga,
                 D=self._camera_D,
-                image_width=640,
-                image_height=480,
+                image_width=output_width,
+                image_height=output_height,
             )
             self._perf_record_step_ms("table", (time.perf_counter() - t0) * 1000.0)
 
             t0 = time.perf_counter()
             self._draw_ball_2d_px_overlay(
-                frame=frame_vga,
+                frame=frame_debug,
                 image_msg=image_msg,
                 scale=scale,
                 pad_x=pad_x,
@@ -674,29 +537,33 @@ class SceneLocalizerDebugNode(Node):
 
             if bool(self.get_parameter("draw_tcp_middle_line").value):
                 t0 = time.perf_counter()
-                self._draw_captured_middle_line_overlay(
-                    frame=frame_vga,
+                self._draw_current_tcp_middle_line_overlay(
+                    frame=frame_debug,
+                    T_cam_table=transforms.get("T_cam_table"),
+                    T_base_table=transforms.get("T_base_table"),
                     K=K_vga,
                     D=self._camera_D,
-                    image_width=640,
-                    image_height=480,
+                    image_width=output_width,
+                    image_height=output_height,
                 )
                 self._perf_record_step_ms("middle_line", (time.perf_counter() - t0) * 1000.0)
 
-            t0 = time.perf_counter()
-            self._draw_ball_trajectory_overlay(
-                frame=frame_vga,
-                now_sec=now_sec,
-                T_cam_table=transforms.get("T_cam_table"),
-                K=K_vga,
-                D=self._camera_D,
-                image_width=640,
-                image_height=480,
-            )
-            self._perf_record_step_ms("trajectory", (time.perf_counter() - t0) * 1000.0)
+            if bool(self.get_parameter("draw_trajectory_extrapolation").value):
+                t0 = time.perf_counter()
+                self._draw_ball_trajectory_overlay(
+                    frame=frame_debug,
+                    now_sec=now_sec,
+                    T_cam_table=transforms.get("T_cam_table"),
+                    T_base_table=transforms.get("T_base_table"),
+                    K=K_vga,
+                    D=self._camera_D,
+                    image_width=output_width,
+                    image_height=output_height,
+                )
+                self._perf_record_step_ms("trajectory", (time.perf_counter() - t0) * 1000.0)
 
         t0 = time.perf_counter()
-        self._publish_debug_image(image_msg, frame_vga)
+        self._publish_debug_image(image_msg, frame_debug)
         self._perf_record_step_ms("publish", (time.perf_counter() - t0) * 1000.0)
         self._last_rendered_image_stamp_ns = image_stamp_ns
 
@@ -714,20 +581,9 @@ class SceneLocalizerDebugNode(Node):
                 1.0,
             )
 
-    def _prepare_vga_frame(self, frame_native: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
-        source_h, source_w = frame_native.shape[:2]
-        scale = min(640.0 / float(source_w), 480.0 / float(source_h))
-        resized_w = max(1, int(round(float(source_w) * scale)))
-        resized_h = max(1, int(round(float(source_h) * scale)))
-
-        resized = cv2.resize(frame_native, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
-
-        frame_vga = np.zeros((480, 640, 3), dtype=np.uint8)
-        pad_x = (640 - resized_w) // 2
-        pad_y = (480 - resized_h) // 2
-        frame_vga[pad_y : pad_y + resized_h, pad_x : pad_x + resized_w] = resized
-
-        return frame_vga, scale, pad_x, pad_y
+    def _prepare_debug_frame(self, frame_native: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
+        """Keep the debug image at the source image's exact dimensions."""
+        return frame_native.copy(), 1.0, 0, 0
 
     def _get_frame_transforms(self, now_sec: float) -> Dict[str, Optional[np.ndarray]]:
         T_cam_table = self._get_camera_from_table_transform(now_sec)
@@ -771,22 +627,14 @@ class SceneLocalizerDebugNode(Node):
 
         u_native = float(ball.point.x)
         v_native = float(ball.point.y)
-        radius_native = float(ball.point.z)
         if not np.isfinite(u_native) or not np.isfinite(v_native):
             return
-        if not np.isfinite(radius_native):
-            radius_native = 0.0
 
         u_vga = (scale * u_native) + float(pad_x)
         v_vga = (scale * v_native) + float(pad_y)
-        radius_vga = max(0.0, scale * radius_native)
 
         center = (int(round(u_vga)), int(round(v_vga)))
-        radius_px = max(0, int(round(radius_vga)))
-
-        cv2.circle(frame, center, 4, (0, 0, 255), -1)
-        if radius_px > 0:
-            cv2.circle(frame, center, radius_px, (0, 255, 255), 2)
+        cv2.circle(frame, center, 6, (0, 0, 255), -1)
 
     def _begin_frame_text(self) -> None:
         self._text_y = 18
@@ -855,7 +703,10 @@ class SceneLocalizerDebugNode(Node):
 
         self._draw_status_text(
             frame,
-            f"src={source_width}x{source_height} -> out=640x480 scale={scale:.3f} pad=({pad_x},{pad_y})",
+            (
+                f"src={source_width}x{source_height} -> "
+                f"out={frame.shape[1]}x{frame.shape[0]} scale={scale:.3f}"
+            ),
             (255, 255, 255),
         )
         self._draw_status_text(
@@ -1030,6 +881,7 @@ class SceneLocalizerDebugNode(Node):
         frame: np.ndarray,
         now_sec: float,
         T_cam_table: Optional[np.ndarray],
+        T_base_table: Optional[np.ndarray],
         K: np.ndarray,
         D: Optional[np.ndarray],
         image_width: int,
@@ -1041,12 +893,11 @@ class SceneLocalizerDebugNode(Node):
         trajectory is usable. This debug node only draws a fresh, valid
         BallTrajectory message. In the current contract:
             start_point = latest fitted ball point in the z=ball_radius plane
-            end_point   = middle-line intersection/hit point
+            end_point   = middle-line intersection/hit X/Y; its displayed Z
+                          follows the live TCP plus tcp_middle_line_z_offset
 
-        The captured middle-line (pink) overlay is persistent scene state and
-        is drawn independently by _draw_captured_middle_line_overlay(); it is
-        intentionally not nested inside this method so it keeps being drawn
-        regardless of ball-trajectory validity/staleness.
+        The current-TCP middle-line (pink) overlay is drawn independently, so
+        it does not depend on ball-trajectory validity or freshness.
         """
         self._draw_status_text(frame, f"traj_overlay now={now_sec:.3f}s", (200, 200, 200))
 
@@ -1130,6 +981,26 @@ class SceneLocalizerDebugNode(Node):
         if not _is_finite_vector(p0_table) or not _is_finite_vector(p1_table):
             self._draw_status_text(frame, "trajectory points non-finite", (0, 140, 255))
             return
+
+        if T_base_table is None:
+            self._draw_status_text(frame, "trajectory: no base/table transform", (0, 140, 255))
+            return
+        robot_base_frame = str(self.get_parameter("robot_base_frame").value)
+        tcp_frame = str(self.get_parameter("tcp_frame").value)
+        T_base_tcp = self._lookup_transform_matrix(
+            robot_base_frame,
+            tcp_frame,
+            "base_to_tcp_trajectory_debug",
+        )
+        if T_base_tcp is None:
+            self._draw_status_text(frame, "trajectory: no current TCP TF", (0, 140, 255))
+            return
+
+        T_table_tcp = _invert_transform(T_base_table) @ T_base_tcp
+        p1_table[2] = (
+            float(T_table_tcp[2, 3])
+            + float(self.get_parameter("tcp_middle_line_z_offset").value)
+        )
 
         line_color = (255, 0, 255)
         start_color = (0, 255, 255)
@@ -1267,129 +1138,73 @@ class SceneLocalizerDebugNode(Node):
             return None
         return _transform_stamped_to_matrix(transform)
 
-    def _draw_captured_middle_line_overlay(
+    def _draw_current_tcp_middle_line_overlay(
         self,
         frame: np.ndarray,
+        T_cam_table: Optional[np.ndarray],
+        T_base_table: Optional[np.ndarray],
         K: np.ndarray,
         D: Optional[np.ndarray],
         image_width: int,
         image_height: int,
     ) -> None:
-        """Draw the authoritative captured middle line.
+        """Draw the live interception line centered on the current TCP.
 
-        Geometry comes only from the cached MiddleLine state (published by
-        trajectory_executor on middle_line_state_topic) and a direct TF
-        lookup from the message's frame to the camera frame. This overlay
-        intentionally does not depend on the live TCP pose, T_table_tcp,
-        table-pose estimation, or ball-trajectory state, so it does not move
-        when the robot moves and remains visible even if those other inputs
-        are unavailable or stale.
+        The line anchor is the live TCP position shifted along table-frame Z
+        by tcp_middle_line_z_offset. The line follows robot-base +x and
+        extends equally in both directions.
         """
         pink = (180, 105, 255)
-
-        line = self._latest_middle_line
-        if line is None:
-            self._draw_status_text(frame, "middle line: waiting for captured state", pink)
+        if T_cam_table is None or T_base_table is None:
+            self._draw_status_text(frame, "TCP middle line: no table transform", pink)
             return
 
-        line_frame = str(line.header.frame_id).strip("/")
-        if not line_frame:
-            self._warn_throttled(
-                "middle_line_frame_empty",
-                "Captured middle-line message has an empty header.frame_id; cannot draw.",
-                2.0,
-            )
-            self._draw_status_text(frame, "middle line: empty frame_id", pink)
+        robot_base_frame = str(self.get_parameter("robot_base_frame").value)
+        tcp_frame = str(self.get_parameter("tcp_frame").value)
+        T_base_tcp = self._lookup_transform_matrix(robot_base_frame, tcp_frame, "base_to_tcp_debug")
+        if T_base_tcp is None:
+            self._draw_status_text(frame, "TCP middle line: no current TCP TF", pink)
             return
 
-        camera_frame = str(self.get_parameter("top_camera_frame").value).strip("/")
-
-        # _lookup_transform_matrix(target_frame, source_frame, ...) returns
-        # T_target_source. We need camera-from-line (T_camera_line), i.e.
-        # target=camera_frame, source=line_frame -- not the inverse.
-        T_camera_line = self._lookup_transform_matrix(
-            camera_frame,
-            line_frame,
-            "camera_from_middle_line",
-        )
-        if T_camera_line is None:
-            self._draw_status_text(
-                frame,
-                f"middle line: no TF {camera_frame} <- {line_frame}",
-                pink,
-            )
-            return
-
-        center_line = np.array(
-            [float(line.center.x), float(line.center.y), float(line.center.z)],
-            dtype=float,
-        )
-        direction_line = np.array(
-            [float(line.direction.x), float(line.direction.y), float(line.direction.z)],
-            dtype=float,
-        )
-        if not _is_finite_vector(center_line) or not _is_finite_vector(direction_line):
-            self._draw_status_text(frame, "middle line: cached geometry non-finite", pink)
-            return
-
-        direction_norm = float(np.linalg.norm(direction_line))
+        T_table_tcp = _invert_transform(T_base_table) @ T_base_tcp
+        tcp_origin_table = T_table_tcp[:3, 3]
+        direction_table = T_base_table[:3, :3].T @ np.array([1.0, 0.0, 0.0], dtype=float)
+        direction_table[2] = 0.0
+        direction_norm = float(np.linalg.norm(direction_table))
         if direction_norm <= 1e-9:
-            self._draw_status_text(frame, "middle line: cached direction degenerate", pink)
+            self._draw_status_text(frame, "TCP middle line: base +x is degenerate", pink)
             return
-        direction_line = direction_line / direction_norm
+        direction_table /= direction_norm
 
-        half_length = float(line.half_length)
-        if not np.isfinite(half_length) or half_length <= 0.0:
-            self._draw_status_text(frame, "middle line: cached half_length invalid", pink)
-            return
-
-        # Published Z is used unchanged: not ball_radius, not table Z, not
-        # live TCP Z, and not any other configured overlay height.
-        p_start_line = center_line - half_length * direction_line
-        p_end_line = center_line + half_length * direction_line
-
-        p_start_cam = _transform_point(T_camera_line, p_start_line)
-        p_end_cam = _transform_point(T_camera_line, p_end_line)
-        center_cam = _transform_point(T_camera_line, center_line)
-
-        clipped = self._clip_camera_edge_to_near_plane(p_start_cam, p_end_cam)
-        if clipped is None:
-            self._draw_status_text(frame, "middle line: not projectable (behind camera)", pink)
-            return
-        c_start_cam, c_end_cam = clipped
-
-        proj = self._project_points(
-            np.vstack([c_start_cam, c_end_cam, center_cam]),
-            K,
-            D,
-            image_width,
-            image_height,
-        )
-        p_start_uv, p_end_uv, center_uv = proj[0], proj[1], proj[2]
-
-        if p_start_uv is None or p_end_uv is None:
-            self._draw_status_text(frame, "middle line: not projectable", pink)
+        center_table = tcp_origin_table.astype(float).copy()
+        center_table[2] += float(self.get_parameter("tcp_middle_line_z_offset").value)
+        half_length = max(0.0, float(self.get_parameter("tcp_middle_line_half_length").value))
+        if half_length <= 0.0:
             return
 
+        start_table = center_table - half_length * direction_table
+        end_table = center_table + half_length * direction_table
         thickness = max(1, int(self.get_parameter("tcp_middle_line_thickness").value))
-        cv2.line(frame, p_start_uv, p_end_uv, pink, thickness)
-
+        drawn = self._draw_table_segment(
+            frame=frame,
+            T_cam_table=T_cam_table,
+            p0_table=start_table,
+            p1_table=end_table,
+            color=pink,
+            thickness=thickness,
+            K=K,
+            D=D,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        center_uv = self._project_table_points(
+            np.vstack([center_table]), T_cam_table, K, D, image_width, image_height
+        )[0]
         if center_uv is not None:
             cv2.circle(frame, center_uv, 4, pink, -1)
-            self._draw_overlay_label(
-                frame,
-                "captured line",
-                (center_uv[0] + 7, center_uv[1] - 7),
-                pink,
-                scale=0.45,
-            )
-
-        self._draw_status_text(
-            frame,
-            f"middle line rev={self._latest_middle_line_revision} "
-            f"half={half_length:.3f} total={2.0 * half_length:.3f} frame={line_frame}",
-            pink,
-        )
+            self._draw_overlay_label(frame, "TCP line", (center_uv[0] + 7, center_uv[1] - 7), pink, scale=0.45)
+        if not drawn:
+            self._draw_status_text(frame, "TCP middle line: not projectable", pink)
 
     def _compute_trajectory_intersection_table(
         self,

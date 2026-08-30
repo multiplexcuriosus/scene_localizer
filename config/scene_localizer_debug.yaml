@@ -10,10 +10,15 @@ scene_localizer_debug:
     tf_lookup_timeout_sec: 0.0
     trajectory_timeout_sec: 0.5
     draw_trajectory_debug_text: true
+    draw_table_rectangle: false
+    draw_tcp_middle_line: true
+    tcp_middle_line_half_length: 0.15
+    tcp_middle_line_z_offset: -0.03
+    tcp_middle_line_thickness: 7
+    draw_trajectory_extrapolation: true
 
     trajectory_line_thickness: 3
     trajectory_start_radius_px: 5
     trajectory_end_radius_px: 7
 
     physical_marker_size: 0.0982
-
